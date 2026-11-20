@@ -9,6 +9,8 @@ from typing import Tuple
 import cv2
 import numpy as np
 
+from local_contrast import ring_contrast
+
 BAR_LEN = 50
 def progress(i, total, tag=''):
     frac = i / total if total else 0
@@ -41,10 +43,12 @@ def recenter_boxes_with_centroid(
     max_frames=None,
     *,
     bright_max_threshold: int = 50,   # threshold still provided by orchestrator
+    min_local_contrast: float | None = None,
 ):
     """
     For each CSV row (frame,x,y,w,h):
       • Drop the row if the brightest pixel in the crop < bright_max_threshold
+      • Drop the row if its local contrast < min_local_contrast (when set)
       • Otherwise recenter using intensity-weighted centroid (on grayscale)
       • Overwrite the same CSV with refined x,y and only the rows that passed
     (Behavior is identical to the original implementation; this version reduces
@@ -114,6 +118,9 @@ def recenter_boxes_with_centroid(
                 if patch_max < int(bright_max_threshold):
                     keep_mask[row_idx] = False
                     continue
+                if min_local_contrast is not None and ring_contrast(gray_u8, x + w / 2.0, y + h / 2.0)[1] < float(min_local_contrast):
+                    keep_mask[row_idx] = False
+                    continue
 
                 # --- recenter using intensity-weighted centroid on gray_f32 ---
                 patch_gray_f32 = gray_f32[y:y+h, x:x+w]
@@ -151,6 +158,9 @@ def recenter_boxes_with_centroid(
                     x = max(0, min(x, W - w)); y = max(0, min(y, H - h))
                     patch_max = int(gray_u8[y:y+h, x:x+w].max()) if w > 0 and h > 0 else 0
                     if patch_max < int(bright_max_threshold):
+                        keep_mask[row_idx] = False
+                        continue
+                    if min_local_contrast is not None and ring_contrast(gray_u8, x + w / 2.0, y + h / 2.0)[1] < float(min_local_contrast):
                         keep_mask[row_idx] = False
                         continue
                     patch_gray_f32 = gray_f32[y:y+h, x:x+w]

@@ -102,6 +102,7 @@ python3 "Pipelines/Pipeline Gateway/gateway.py" \
 | 8.5 | `stage8_5_blob_area_filter.py` | Removes detections with too-small bright connected components. | Updated CSV/logits |
 | 8.6 | `stage8_6_neighbor_hunt.py` | Masks known detections, reruns detection on blacked-out video, merges new neighbors. | `stage8.6/<stem>/run_*` |
 | 8.7 | `stage8_7_large_flash_bfs.py` | Repairs large flashes by BFS region growth and replacement. | `stage8.7/<stem>/replacements` |
+| 8.8 | `stage8_8_streak_grow_filter.py` | Grows seed streaks down to a lower contrast and drops flashes that are too long, too narrow, or flat. | Updated CSV/logits, `stage8.8/<stem>_streaks.csv` |
 | 8.9 | `stage8_9_gt_gaussian_centroid.py` | Recenters annotator-style GT and overwrites it as `x,y,t`. | `ground truth/gt.csv` |
 | 9 | `stage9_validate.py` | Matches predictions to GT. | `stage9 validation/<stem>/thr_*` |
 | 10 | `stage10_overlay_gt_vs_model.py` | Renders GT/model/overlap videos. | `stage10 overlay videos/` |
@@ -129,6 +130,7 @@ Common edit points in `pipeline_params.py`:
 - `RUN_PRE_RUN_CLEANUP` - defaults to `True`.
 - `STAGE1_VARIANT`.
 - `BRIGHT_MAX_THRESHOLD`.
+- `SEED_CONTRAST_THRESHOLD`.
 - `AREA_THRESHOLD_PX`.
 - `CNN_MODEL_PATH`, `FIREFLY_CONF_THRESH`, `DROP_BACKGROUND_ROWS`.
 - `STAGE7_DIST_THRESHOLD_PX`.

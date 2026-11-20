@@ -28,6 +28,7 @@ source video
   -> Stage 8.6 neighbor hunt
   -> Stage 8.7 large-flash repair
   -> Stage 8.5 after repair
+  -> Stage 8.8 streak grow and shape filter
   -> Stage 8.9 GT recenter
   -> Stage 9 validation
   -> Stage 11/12 FN/FP analysis
@@ -132,12 +133,18 @@ Purpose:
 - Opens each candidate crop in the original video.
 - Recenters boxes based on intensity centroid.
 - Drops dim crops whose maximum brightness is below `BRIGHT_MAX_THRESHOLD`.
+- Drops crops whose local contrast is below `SEED_CONTRAST_THRESHOLD`, so only the strong part of each flash (the seed) goes on to the classifier.
 
-Important parameter:
+Local contrast is the brightest pixel in an 11x11 core minus the median of the surrounding ring (41x41 window with the central 13x13 removed), divided by the robust spread of that ring. It is computed in `local_contrast.py` and shared with Stage 8.8.
+
+Important parameters:
 
 ```python
 BRIGHT_MAX_THRESHOLD = 50
+SEED_CONTRAST_THRESHOLD = 30.0
 ```
+
+Set `SEED_CONTRAST_THRESHOLD = None` to disable the contrast gate.
 
 ## Stage 3 - Area Filter
 
@@ -397,6 +404,46 @@ RUN_STAGE8_5_AFTER_8_7 = True
 ```
 
 This re-validates repaired/recentered boxes against the same bright-area filter.
+
+## Stage 8.8 - Streak Grow and Shape Filter
+
+File:
+
+```text
+stage8_8_streak_grow_filter.py
+```
+
+Input/output:
+
+```text
+ROOT/csv files/<video_stem>.csv
+```
+
+Report:
+
+```text
+ROOT/stage8.8/<video_stem>_streaks.csv
+```
+
+Purpose:
+
+- Links firefly rows (the seeds that passed Stage 2) into streaks. A streak is one flash, not a trajectory.
+- Reads the local contrast at each streak's position from `STAGE8_8_GROW_FRAMES` before its first seed to the same number after its last.
+- Grows each flash over the frames whose contrast is at least `STAGE8_8_GROW_CONTRAST_THRESHOLD`, adding firefly rows for the dim start and end.
+- Drops flashes that are longer than `STAGE8_8_MAX_STREAK_SECONDS`, narrower than `STAGE8_8_MIN_WIDTH_FRAMES` at half their peak, or flat (level just before and after above `STAGE8_8_MAX_BASE_FRAC` of the peak).
+- Added rows copy the logits of the nearest seed in the same flash.
+- Writes one report row per flash with its measurements and the reason it was dropped.
+
+Important parameters:
+
+- `STAGE8_8_GROW_CONTRAST_THRESHOLD`
+- `STAGE8_8_LINK_RADIUS_PX`
+- `STAGE8_8_GROW_FRAMES`
+- `STAGE8_8_MAX_FRAME_GAP`
+- `STAGE8_8_MIN_WIDTH_FRAMES`
+- `STAGE8_8_MAX_BASE_FRAC`
+- `STAGE8_8_MAX_STREAK_SECONDS`
+- `STAGE8_8_DEDUPE_PX`
 
 ## Stage 8.9 - GT Recenter
 

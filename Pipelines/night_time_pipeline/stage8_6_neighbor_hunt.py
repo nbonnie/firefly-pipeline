@@ -331,6 +331,7 @@ def stage8_6_run(
 
     # Stage-2
     BRIGHT_MAX_THRESHOLD     = ORC.BRIGHT_MAX_THRESHOLD
+    SEED_CONTRAST_THRESHOLD  = getattr(ORC, 'SEED_CONTRAST_THRESHOLD', None)
 
     # Stage-3
     AREA_THRESHOLD_PX        = ORC.AREA_THRESHOLD_PX
@@ -449,6 +450,7 @@ def stage8_6_run(
             csv_path=sub_csv,
             max_frames=MAX_FRAMES,
             bright_max_threshold=BRIGHT_MAX_THRESHOLD,
+            min_local_contrast=SEED_CONTRAST_THRESHOLD,
         )
         _t['s2'] = time.perf_counter() - _t0
 

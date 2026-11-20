@@ -62,6 +62,7 @@ RUN_STAGE8 = True
 RUN_STAGE8_5 = True
 RUN_STAGE8_6 = True
 RUN_STAGE8_7 = True
+RUN_STAGE8_8 = True
 RUN_STAGE8_9 = True
 RUN_STAGE8_5_AFTER_8_7 = True
 RUN_STAGE9 = True
@@ -143,6 +144,7 @@ Use these when `STAGE1_VARIANT` is `cc_cpu` or `cc_cuda`.
 
 ```python
 BRIGHT_MAX_THRESHOLD = 50
+SEED_CONTRAST_THRESHOLD = 30.0
 AREA_THRESHOLD_PX = 6
 MIN_PIXEL_BRIGHTNESS_TO_BE_CONSIDERED_IN_AREA_CALCULATION = 20
 ```
@@ -150,6 +152,8 @@ MIN_PIXEL_BRIGHTNESS_TO_BE_CONSIDERED_IN_AREA_CALCULATION = 20
 These affect Stage 2, Stage 3, Stage 8.5, and validation GT filtering.
 
 Raising thresholds improves precision but can miss dim flashes.
+
+`SEED_CONTRAST_THRESHOLD` is the Stage 2 local-contrast gate. It is relative to each candidate's own surroundings, so bright sky and sensor grain do not pass it the way they pass the absolute thresholds. `None` disables it.
 
 ## CNN Filter
 
@@ -202,6 +206,26 @@ STAGE8_7_MIN_SQUARE_AREA_PX = 75
 Stage 8.6 improves recall around masked existing detections.
 
 Stage 8.7 repairs large flashes that were split into smaller shards.
+
+## Streak Grow and Shape Filter
+
+```python
+STAGE8_8_GROW_CONTRAST_THRESHOLD = 10.0
+STAGE8_8_LINK_RADIUS_PX = 12.0
+STAGE8_8_GROW_FRAMES = 15
+STAGE8_8_MAX_FRAME_GAP = 2
+STAGE8_8_MIN_WIDTH_FRAMES = 2
+STAGE8_8_MAX_BASE_FRAC = 0.35
+STAGE8_8_MAX_STREAK_SECONDS = 3.0
+STAGE8_8_DEDUPE_PX = 4.0
+```
+
+Stage 8.8 grows each seed streak down to the grow contrast and then keeps only flashes with a flash-like intensity curve.
+
+- Lower `STAGE8_8_GROW_CONTRAST_THRESHOLD` to follow flash tails further into the noise.
+- `STAGE8_8_MIN_WIDTH_FRAMES = 2` removes single-frame blips such as hot pixels. Use `1` for species whose flashes last one frame.
+- Raise `STAGE8_8_MAX_STREAK_SECONDS` for species with long glows.
+- `STAGE8_8_GROW_FRAMES` limits how far a tail is followed and how far apart two seeds of one flash may be.
 
 ## Validation
 

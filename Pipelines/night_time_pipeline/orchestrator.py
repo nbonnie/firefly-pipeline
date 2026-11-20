@@ -39,6 +39,7 @@ from stage11_fn_analysis import stage11_fn_nearest_tp_analysis
 from stage12_fp_analysis import stage12_fp_nearest_tp_analysis
 from stage8_6_neighbor_hunt import stage8_6_run
 from stage8_7_large_flash_bfs import stage8_7_expand_large_fireflies
+from stage8_8_streak_grow_filter import stage8_8_grow_and_filter_streaks
 from stage8_9_gt_gaussian_centroid import stage8_9_recenter_gt_gaussian_centroid
 
 from stage8_sync import rebuild_fireflies_logits_from_main
@@ -73,7 +74,8 @@ def _print_stage_timing(stage_times: dict, video_stem: str):
     pipeline_order = [
         '01_detect','02_recenter','03_area_filter','04_cnn',
         '07_merge','08_gauss','08_5_blob_area','08_6_neighbor_hunt',
-        '08_7_large_flash_bfs','08_5_after_8_7'  # <- included if present
+        '08_7_large_flash_bfs','08_5_after_8_7',  # <- included if present
+        '08_8_streak_filter'
     ]
     # Rendering-only (excluded from pipeline total; printed separately)
     render_order = ['05_render','06_render10']
@@ -237,6 +239,7 @@ def main():
                 csv_path=csv_path,
                 max_frames=MAX_FRAMES,
                 bright_max_threshold=BRIGHT_MAX_THRESHOLD,
+                min_local_contrast=SEED_CONTRAST_THRESHOLD,
             )
             stage_times['02_recenter'] = time.perf_counter() - _t0
 
@@ -403,6 +406,30 @@ def main():
                 verbose=True,
             )
             stage_times['08_5_after_8_7'] = time.perf_counter() - _t0
+            rebuild_fireflies_logits_from_main(csv_path)
+
+        # Stage 8.8 — grow seed streaks down to the low contrast, then filter by flash shape
+        if RUN_STAGE8_8:
+            _t0 = time.perf_counter()
+            stage8_8_grow_and_filter_streaks(
+                orig_video_path=orig_path,
+                csv_path=csv_path,
+                report_csv_path=ROOT / 'stage8.8' / f'{base}_streaks.csv',
+                seed_contrast=SEED_CONTRAST_THRESHOLD,
+                grow_contrast=STAGE8_8_GROW_CONTRAST_THRESHOLD,
+                link_radius_px=STAGE8_8_LINK_RADIUS_PX,
+                grow_frames=STAGE8_8_GROW_FRAMES,
+                max_frame_gap=STAGE8_8_MAX_FRAME_GAP,
+                min_width_frames=STAGE8_8_MIN_WIDTH_FRAMES,
+                max_base_frac=STAGE8_8_MAX_BASE_FRAC,
+                max_streak_seconds=STAGE8_8_MAX_STREAK_SECONDS,
+                dedupe_px=STAGE8_8_DEDUPE_PX,
+                box_w=STAGE8_PATCH_W,
+                box_h=STAGE8_PATCH_H,
+                max_frames=MAX_FRAMES,
+                verbose=True,
+            )
+            stage_times['08_8_streak_filter'] = time.perf_counter() - _t0
             rebuild_fireflies_logits_from_main(csv_path)
         
 
