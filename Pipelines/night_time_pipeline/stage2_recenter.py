@@ -37,6 +37,46 @@ def intensity_weighted_centroid_cached(gray_patch_f32: np.ndarray) -> Tuple[floa
     cy = float((ys * gray_patch_f32).sum() / total)
     return cx, cy
 
+def recenter_frame_rows(frame, items, rows, keep_mask, W, H, bright_max_threshold, min_local_contrast):
+    # 1) one grayscale conversion per frame
+    gray_u8 = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    # 2) float32 once per frame for centroid math (matches original)
+    gray_f32 = gray_u8.astype(np.float32)
+
+    for row_idx, x, y, w, h in items:
+        # clamp to frame
+        w = max(1, min(w, W)); h = max(1, min(h, H))
+        x = max(0, min(x, W - w)); y = max(0, min(y, H - h))
+
+        # --- brightest-pixel guard (read from precomputed gray_u8) ---
+        # this is IDENTICAL to max(cv2.cvtColor(color_patch, ...)) but avoids
+        # another conversion, since gray_u8 was created from the same frame.
+        patch_max = int(gray_u8[y:y+h, x:x+w].max()) if w > 0 and h > 0 else 0
+        if patch_max < int(bright_max_threshold):
+            keep_mask[row_idx] = False
+            continue
+        if min_local_contrast is not None and ring_contrast(gray_u8, x + w / 2.0, y + h / 2.0)[1] < float(min_local_contrast):
+            keep_mask[row_idx] = False
+            continue
+
+        # --- recenter using intensity-weighted centroid on gray_f32 ---
+        patch_gray_f32 = gray_f32[y:y+h, x:x+w]
+        if patch_gray_f32.size == 0:
+            keep_mask[row_idx] = False
+            continue
+
+        cx_rel, cy_rel = intensity_weighted_centroid_cached(patch_gray_f32)
+        cx_full = x + cx_rel
+        cy_full = y + cy_rel
+
+        new_x = int(round(cx_full - w/2))
+        new_y = int(round(cy_full - h/2))
+        new_x = max(0, min(new_x, W - w))
+        new_y = max(0, min(new_y, H - h))
+
+        rows[row_idx]['x'] = str(new_x)
+        rows[row_idx]['y'] = str(new_y)
+
 def recenter_boxes_with_centroid(
     orig_path: Path,
     csv_path: Path,
@@ -100,45 +140,7 @@ def recenter_boxes_with_centroid(
             ok, frame = cap.read()
             if not ok:
                 continue
-            # 1) one grayscale conversion per frame
-            gray_u8 = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            # 2) float32 once per frame for centroid math (matches original)
-            gray_f32 = gray_u8.astype(np.float32)
-
-            for row_idx, x, y, w, h in by_frame[fr]:
-                r = rows[row_idx]
-                # clamp to frame
-                w = max(1, min(w, W)); h = max(1, min(h, H))
-                x = max(0, min(x, W - w)); y = max(0, min(y, H - h))
-
-                # --- brightest-pixel guard (read from precomputed gray_u8) ---
-                # this is IDENTICAL to max(cv2.cvtColor(color_patch, ...)) but avoids
-                # another conversion, since gray_u8 was created from the same frame.
-                patch_max = int(gray_u8[y:y+h, x:x+w].max()) if w > 0 and h > 0 else 0
-                if patch_max < int(bright_max_threshold):
-                    keep_mask[row_idx] = False
-                    continue
-                if min_local_contrast is not None and ring_contrast(gray_u8, x + w / 2.0, y + h / 2.0)[1] < float(min_local_contrast):
-                    keep_mask[row_idx] = False
-                    continue
-
-                # --- recenter using intensity-weighted centroid on gray_f32 ---
-                patch_gray_f32 = gray_f32[y:y+h, x:x+w]
-                if patch_gray_f32.size == 0:
-                    keep_mask[row_idx] = False
-                    continue
-
-                cx_rel, cy_rel = intensity_weighted_centroid_cached(patch_gray_f32)
-                cx_full = x + cx_rel
-                cy_full = y + cy_rel
-
-                new_x = int(round(cx_full - w/2))
-                new_y = int(round(cy_full - h/2))
-                new_x = max(0, min(new_x, W - w))
-                new_y = max(0, min(new_y, H - h))
-
-                rows[row_idx]['x'] = str(new_x)
-                rows[row_idx]['y'] = str(new_y)
+            recenter_frame_rows(frame, by_frame[fr], rows, keep_mask, W, H, bright_max_threshold, min_local_contrast)
             progress(i+1, total, 'recenter')
     else:
         fr = 0
@@ -150,32 +152,7 @@ def recenter_boxes_with_centroid(
                 break
 
             if fr in by_frame:
-                gray_u8 = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                gray_f32 = gray_u8.astype(np.float32)
-                for row_idx, x, y, w, h in by_frame[fr]:
-                    r = rows[row_idx]
-                    w = max(1, min(w, W)); h = max(1, min(h, H))
-                    x = max(0, min(x, W - w)); y = max(0, min(y, H - h))
-                    patch_max = int(gray_u8[y:y+h, x:x+w].max()) if w > 0 and h > 0 else 0
-                    if patch_max < int(bright_max_threshold):
-                        keep_mask[row_idx] = False
-                        continue
-                    if min_local_contrast is not None and ring_contrast(gray_u8, x + w / 2.0, y + h / 2.0)[1] < float(min_local_contrast):
-                        keep_mask[row_idx] = False
-                        continue
-                    patch_gray_f32 = gray_f32[y:y+h, x:x+w]
-                    if patch_gray_f32.size == 0:
-                        keep_mask[row_idx] = False
-                        continue
-                    cx_rel, cy_rel = intensity_weighted_centroid_cached(patch_gray_f32)
-                    cx_full = x + cx_rel
-                    cy_full = y + cy_rel
-                    new_x = int(round(cx_full - w/2))
-                    new_y = int(round(cy_full - h/2))
-                    new_x = max(0, min(new_x, W - w))
-                    new_y = max(0, min(new_y, H - h))
-                    rows[row_idx]['x'] = str(new_x)
-                    rows[row_idx]['y'] = str(new_y)
+                recenter_frame_rows(frame, by_frame[fr], rows, keep_mask, W, H, bright_max_threshold, min_local_contrast)
             progress(fr+1, total, 'recenter'); fr += 1
 
     cap.release()

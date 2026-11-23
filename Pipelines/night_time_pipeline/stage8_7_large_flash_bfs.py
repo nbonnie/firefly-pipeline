@@ -213,6 +213,286 @@ def _euclid(a: Tuple[float,float], b: Tuple[float,float]) -> float:
     dy = float(a[1]) - float(b[1])
     return math.hypot(dx, dy)
 
+def expand_frame_rows(
+    frame, fr: int, rows_f: List[dict], *,
+    has_class: bool, has_xy_sem: bool,
+    neighbor_intensity_threshold: int, dedupe_dist_px: float,
+    min_square_area_px: int, gaussian_sigma: float,
+    out_root: Path, metrics: Dict[str, int],
+) -> List[dict]:
+    H, W = frame.shape[:2]
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # Build original-list and candidate replacements for THIS frame
+    # Each cand: dict with keys (new_cx, new_cy, side, weight, src_idx, src_row)
+    cands: List[dict] = []
+    cand_src_idxs = set()
+    for idx, r in enumerate(rows_f):
+        # Only firefly rows can seed candidates
+        if has_class and r.get('class', 'firefly') != 'firefly':
+            continue
+
+        # Derive center from semantics (expect center after Stage-8)
+        try:
+            w = int(round(float(r.get('w', 10)))); h = int(round(float(r.get('h', 10))))
+            if has_xy_sem and str(r.get('xy_semantics','')).lower() == 'center':
+                cx = float(r['x']); cy = float(r['y'])
+            else:
+                cx = float(r['x']) + w/2.0; cy = float(r['y']) + h/2.0
+        except Exception:
+            continue
+
+        sx, sy = int(round(cx)), int(round(cy))
+        if not (0 <= sx < W and 0 <= sy < H):
+            continue
+        if int(gray[sy, sx]) < int(neighbor_intensity_threshold):
+            metrics['skipped_dim_seed'] += 1
+            continue
+
+        mask_roi, (minx, miny, maxx, maxy) = _bfs_region(gray, sx, sy, int(neighbor_intensity_threshold))
+        if mask_roi.size == 0:
+            continue
+
+        # Compute Gaussian/intensity centroid within grown region
+        roi = gray[miny:maxy+1, minx:maxx+1]
+        ccx_roi, ccy_roi = _masked_centroid(roi, mask_roi, float(gaussian_sigma))
+        new_cx = float(minx) + float(ccx_roi)
+        new_cy = float(miny) + float(ccy_roi)
+
+        # Minimum square centered at (new_cx,new_cy) that contains region
+        side, x0, y0 = _centered_min_square_for_region(new_cx, new_cy, minx, miny, maxx, maxy)
+        side = int(max(1, min(side, min(W, H))))  # clamp side to frame
+
+        if side * side <= int(min_square_area_px):  # must EXCEED 10×10 area
+            continue
+
+        wt = _rgb_sum_center_square(frame, new_cx, new_cy, side)
+
+        cands.append({
+            'new_cx': new_cx, 'new_cy': new_cy, 'side': side, 'weight': wt,
+            'src_idx': idx, 'src_row': r
+        })
+        cand_src_idxs.add(idx)
+
+    metrics['frames_seen'] += 1
+    metrics['candidates']  += len(cands)
+
+    # ──────────────────────────────────────────────────────
+    # Global union-find across BOTH candidates and leftover originals
+    # Node list = candidates + original firefly rows (that are not their sources)
+    nodes: List[dict] = []
+    # candidates
+    for ci, c in enumerate(cands):
+        nodes.append({
+            'kind': 'cand', 'cand_idx': ci, 'row_idx': c['src_idx'],
+            'cx': c['new_cx'], 'cy': c['new_cy'], 'side': c['side'], 'weight': c['weight']
+        })
+    # originals (include all firefly rows; dedupe will resolve with candidates)
+    for i, r in enumerate(rows_f):
+        if has_class and r.get('class','firefly') != 'firefly':
+            continue
+        # compute center for this row
+        try:
+            w = int(round(float(r.get('w', 10))))
+            h = int(round(float(r.get('h', 10))))
+            if has_xy_sem and str(r.get('xy_semantics','')).lower() == 'center':
+                rcx = float(r['x']); rcy = float(r['y'])
+            else:
+                rcx = float(r['x']) + w/2.0
+                rcy = float(r['y']) + h/2.0
+        except Exception:
+            continue
+        # weight for tie-breaks among originals if ever needed
+        wt = _rgb_sum_center_square(frame, rcx, rcy, max(w, h))
+        nodes.append({
+            'kind': 'orig', 'row_idx': i,
+            'cx': rcx, 'cy': rcy, 'side': max(w, h), 'weight': wt
+        })
+
+    N = len(nodes)
+    kept_cands: List[dict] = []
+    to_remove = set()
+
+    if N:
+        parent = list(range(N))
+        def find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        thr = float(dedupe_dist_px)
+        # union by centroid distance
+        for i in range(N):
+            ci = (nodes[i]['cx'], nodes[i]['cy'])
+            for j in range(i+1, N):
+                cj = (nodes[j]['cx'], nodes[j]['cy'])
+                if _euclid(ci, cj) <= thr:
+                    union(i, j)
+
+        # bucket groups
+        groups: Dict[int, List[int]] = defaultdict(list)
+        for i in range(N):
+            groups[find(i)].append(i)
+
+        metrics['dedup_groups'] += len(groups)
+
+        # For each group: if any candidate exists, keep the heaviest candidate; remove all others (orig+cand).
+        for root, gidxs in groups.items():
+            cand_nodes = [k for k in gidxs if nodes[k]['kind'] == 'cand']
+            orig_nodes = [k for k in gidxs if nodes[k]['kind'] == 'orig']
+
+            if not cand_nodes:
+                # no candidate in this group → keep originals as-is
+                continue
+
+            # choose best candidate by weight
+            best_k = max(cand_nodes, key=lambda k: nodes[k]['weight'])
+            best_ci = nodes[best_k]['cand_idx']
+            best = cands[best_ci]
+            # record replacement
+            # gather all original rows this group replaces (both cand sources and original nodes)
+            group_src_rows = []
+            seen_src = set()
+
+            # add all candidate sources in this group
+            for k in cand_nodes:
+                ci2 = nodes[k]['cand_idx']
+                src_idx2 = cands[ci2]['src_idx']
+                if src_idx2 not in seen_src:
+                    group_src_rows.append(rows_f[src_idx2])
+                    seen_src.add(src_idx2)
+                to_remove.add(src_idx2)
+
+            # add all original nodes in this group
+            for k in orig_nodes:
+                ri = nodes[k]['row_idx']
+                if ri not in seen_src:
+                    group_src_rows.append(rows_f[ri])
+                    seen_src.add(ri)
+                to_remove.add(ri)
+
+            # also ensure the winning candidate's own source is removed
+            to_remove.add(best['src_idx'])
+
+            # store kept candidate along with all contributing old rows
+            kept_cands.append({
+                'new_cx': best['new_cx'], 'new_cy': best['new_cy'],
+                'side': best['side'], 'weight': best['weight'],
+                'src_idx': best['src_idx'], 'src_row': best['src_row'],
+                'group_src_rows': group_src_rows,
+                'group_id': int(root),
+            })
+
+    metrics['old_rows_removed'] += len(to_remove)
+
+    # Build frame rows: keep everything not removed, then append replacements
+    frame_out_rows: List[dict] = []
+    for i, r in enumerate(rows_f):
+        if i in to_remove:
+            continue
+        frame_out_rows.append(r)
+
+    for g in kept_cands:
+        src = dict(g['src_row'])
+        src['x']  = float(g['new_cx'])
+        src['y']  = float(g['new_cy'])
+        src['w']  = int(g['side'])
+        src['h']  = int(g['side'])
+        src['xy_semantics'] = 'center'
+        frame_out_rows.append(src)
+
+    # Save crops for each kept replacement — each in its own folder
+    for g in kept_cands:
+        src = g['src_row']
+        # collect old crop metadata from all contributing rows
+        old_crops_data = []
+        for orow in g['group_src_rows']:
+            try:
+                ow = int(round(float(orow.get('w', 10)))); oh = int(round(float(orow.get('h', 10))))
+                if has_xy_sem and str(orow.get('xy_semantics','')).lower() == 'center':
+                    ocx = float(orow['x']); ocy = float(orow['y'])
+                else:
+                    ocx = float(orow['x']) + ow/2.0; ocy = float(orow['y']) + oh/2.0
+            except Exception:
+                continue
+            ox0 = int(round(ocx - ow/2.0)); oy0 = int(round(ocy - oh/2.0))
+            ox0 = max(0, min(ox0, W - ow)); oy0 = max(0, min(oy0, H - oh))
+            old_crop = frame[oy0:oy0+oh, ox0:ox0+ow]
+            old_crops_data.append({
+                'crop': old_crop, 'x0': ox0, 'y0': oy0, 'w': ow, 'h': oh,
+                'cx': ocx, 'cy': ocy
+            })
+
+        # new crop (center semantics)
+        ns = int(g['side'])
+        ncx, ncy = float(g['new_cx']), float(g['new_cy'])
+        nx0 = int(round(ncx - ns/2.0)); ny0 = int(round(ncy - ns/2.0))
+        nx0 = max(0, min(nx0, W - ns)); ny0 = max(0, min(ny0, H - ns))
+        new_crop = frame[ny0:ny0+ns, nx0:nx0+ns]
+
+        # build folder and filenames with details
+        bg = src.get('background_logit', '')
+        ff = src.get('firefly_logit', '')
+        conf = src.get('firefly_confidence', '')
+        ncxi, ncyi = int(round(ncx)), int(round(ncy))
+        base = f"t{fr:06d}_new_x{ncxi}_y{ncyi}_{ns}x{ns}_thr{int(neighbor_intensity_threshold)}"
+        if ff != '' or bg != '':
+            base += f"_ff{ff}_bg{bg}"
+        if conf != '':
+            base += f"_conf{conf}"
+
+        out_folder = out_root / base
+        _ensure_dir(out_folder)
+
+        # save all old crops (each file carries its own details)
+        for k, d in enumerate(old_crops_data):
+            ocxi, ocyi = int(round(d['cx'])), int(round(d['cy']))
+            ow, oh = d['w'], d['h']
+            old_path = out_folder / f"OLD_{k:02d}_x{ocxi}_y{ocyi}_{ow}x{oh}.png"
+            cv2.imwrite(str(old_path), d['crop'])
+
+        # save new crop
+        new_path = out_folder / f"NEW_x{ncxi}_y{ncyi}_{ns}x{ns}.png"
+        cv2.imwrite(str(new_path), new_crop)
+
+        # 100x100 annotated context crop (new=green, old=red)
+        annot = frame.copy()
+        cv2.rectangle(annot, (nx0, ny0), (nx0+ns-1, ny0+ns-1), (0,255,0), _ANNOTATION_BOX_THICKNESS)
+        for d in old_crops_data:
+            ox0, oy0, ow, oh = d['x0'], d['y0'], d['w'], d['h']
+            cv2.rectangle(annot, (ox0, oy0), (ox0+ow-1, oy0+oh-1), (0,0,255), _ANNOTATION_BOX_THICKNESS)
+
+        xs = [nx0, nx0+ns-1] + [d['x0'] for d in old_crops_data] + [d['x0']+d['w']-1 for d in old_crops_data]
+        ys = [ny0, ny0+ns-1] + [d['y0'] for d in old_crops_data] + [d['y0']+d['h']-1 for d in old_crops_data]
+        if xs and ys:
+            bx0, bx1 = max(0, min(xs)), min(W-1, max(xs))
+            by0, by1 = max(0, min(ys)), min(H-1, max(ys))
+            bc_x = (bx0 + bx1) / 2.0
+            bc_y = (by0 + by1) / 2.0
+        else:
+            bc_x, bc_y = ncx, ncy
+
+        ctx_side = 100
+        ctx_s = min(ctx_side, W, H)
+        cx0 = int(round(bc_x - ctx_s/2.0))
+        cy0 = int(round(bc_y - ctx_s/2.0))
+        cx0 = max(0, min(cx0, W - ctx_s))
+        cy0 = max(0, min(cy0, H - ctx_s))
+        context = annot[cy0:cy0+ctx_s, cx0:cx0+ctx_s]
+
+        ctx_path = out_folder / ("CONTEXT_100.png" if ctx_s == 100 else f"CONTEXT_{ctx_s}.png")
+        cv2.imwrite(str(ctx_path), context)
+
+    metrics['replaced']          += len(kept_cands)
+    metrics['new_rows_inserted'] += len(kept_cands)
+
+    return frame_out_rows
+
 # ──────────────────────────────────────────────────────────────
 def stage8_7_expand_large_fireflies(
     *,
@@ -299,276 +579,15 @@ def stage8_7_expand_large_fireflies(
         if not rows_f:
             _progress(fr+1, limit, 'stage8.7'); fr += 1; continue
 
-        H, W = frame.shape[:2]
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # Build original-list and candidate replacements for THIS frame
-        # Each cand: dict with keys (new_cx, new_cy, side, weight, src_idx, src_row)
-        cands: List[dict] = []
-        cand_src_idxs = set()
-        for idx, r in enumerate(rows_f):
-            # Only firefly rows can seed candidates
-            if has_class and r.get('class', 'firefly') != 'firefly':
-                continue
-
-            # Derive center from semantics (expect center after Stage-8)
-            try:
-                w = int(round(float(r.get('w', 10)))); h = int(round(float(r.get('h', 10))))
-                if has_xy_sem and str(r.get('xy_semantics','')).lower() == 'center':
-                    cx = float(r['x']); cy = float(r['y'])
-                else:
-                    cx = float(r['x']) + w/2.0; cy = float(r['y']) + h/2.0
-            except Exception:
-                continue
-
-            sx, sy = int(round(cx)), int(round(cy))
-            if not (0 <= sx < W and 0 <= sy < H):
-                continue
-            if int(gray[sy, sx]) < int(neighbor_intensity_threshold):
-                metrics['skipped_dim_seed'] += 1
-                continue
-
-            mask_roi, (minx, miny, maxx, maxy) = _bfs_region(gray, sx, sy, int(neighbor_intensity_threshold))
-            if mask_roi.size == 0:
-                continue
-
-            # Compute Gaussian/intensity centroid within grown region
-            roi = gray[miny:maxy+1, minx:maxx+1]
-            ccx_roi, ccy_roi = _masked_centroid(roi, mask_roi, float(gaussian_sigma))
-            new_cx = float(minx) + float(ccx_roi)
-            new_cy = float(miny) + float(ccy_roi)
-
-            # Minimum square centered at (new_cx,new_cy) that contains region
-            side, x0, y0 = _centered_min_square_for_region(new_cx, new_cy, minx, miny, maxx, maxy)
-            side = int(max(1, min(side, min(W, H))))  # clamp side to frame
-
-            if side * side <= int(min_square_area_px):  # must EXCEED 10×10 area
-                continue
-
-            wt = _rgb_sum_center_square(frame, new_cx, new_cy, side)
-
-            cands.append({
-                'new_cx': new_cx, 'new_cy': new_cy, 'side': side, 'weight': wt,
-                'src_idx': idx, 'src_row': r
-            })
-            cand_src_idxs.add(idx)
-
-        metrics['frames_seen'] += 1
-        metrics['candidates']  += len(cands)
-
-        # ──────────────────────────────────────────────────────
-        # Global union-find across BOTH candidates and leftover originals
-        # Node list = candidates + original firefly rows (that are not their sources)
-        nodes: List[dict] = []
-        # candidates
-        for ci, c in enumerate(cands):
-            nodes.append({
-                'kind': 'cand', 'cand_idx': ci, 'row_idx': c['src_idx'],
-                'cx': c['new_cx'], 'cy': c['new_cy'], 'side': c['side'], 'weight': c['weight']
-            })
-        # originals (include all firefly rows; dedupe will resolve with candidates)
-        for i, r in enumerate(rows_f):
-            if has_class and r.get('class','firefly') != 'firefly':
-                continue
-            # compute center for this row
-            try:
-                w = int(round(float(r.get('w', 10))))
-                h = int(round(float(r.get('h', 10))))
-                if has_xy_sem and str(r.get('xy_semantics','')).lower() == 'center':
-                    rcx = float(r['x']); rcy = float(r['y'])
-                else:
-                    rcx = float(r['x']) + w/2.0
-                    rcy = float(r['y']) + h/2.0
-            except Exception:
-                continue
-            # weight for tie-breaks among originals if ever needed
-            wt = _rgb_sum_center_square(frame, rcx, rcy, max(w, h))
-            nodes.append({
-                'kind': 'orig', 'row_idx': i,
-                'cx': rcx, 'cy': rcy, 'side': max(w, h), 'weight': wt
-            })
-
-        N = len(nodes)
-        kept_cands: List[dict] = []
-        to_remove = set()
-
-        if N:
-            parent = list(range(N))
-            def find(a):
-                while parent[a] != a:
-                    parent[a] = parent[parent[a]]
-                    a = parent[a]
-                return a
-            def union(a, b):
-                ra, rb = find(a), find(b)
-                if ra != rb:
-                    parent[ra] = rb
-
-            thr = float(dedupe_dist_px)
-            # union by centroid distance
-            for i in range(N):
-                ci = (nodes[i]['cx'], nodes[i]['cy'])
-                for j in range(i+1, N):
-                    cj = (nodes[j]['cx'], nodes[j]['cy'])
-                    if _euclid(ci, cj) <= thr:
-                        union(i, j)
-
-            # bucket groups
-            groups: Dict[int, List[int]] = defaultdict(list)
-            for i in range(N):
-                groups[find(i)].append(i)
-
-            metrics['dedup_groups'] += len(groups)
-
-            # For each group: if any candidate exists, keep the heaviest candidate; remove all others (orig+cand).
-            for root, gidxs in groups.items():
-                cand_nodes = [k for k in gidxs if nodes[k]['kind'] == 'cand']
-                orig_nodes = [k for k in gidxs if nodes[k]['kind'] == 'orig']
-
-                if not cand_nodes:
-                    # no candidate in this group → keep originals as-is
-                    continue
-
-                # choose best candidate by weight
-                best_k = max(cand_nodes, key=lambda k: nodes[k]['weight'])
-                best_ci = nodes[best_k]['cand_idx']
-                best = cands[best_ci]
-                # record replacement
-                # gather all original rows this group replaces (both cand sources and original nodes)
-                group_src_rows = []
-                seen_src = set()
-
-                # add all candidate sources in this group
-                for k in cand_nodes:
-                    ci2 = nodes[k]['cand_idx']
-                    src_idx2 = cands[ci2]['src_idx']
-                    if src_idx2 not in seen_src:
-                        group_src_rows.append(rows_f[src_idx2])
-                        seen_src.add(src_idx2)
-                    to_remove.add(src_idx2)
-
-                # add all original nodes in this group
-                for k in orig_nodes:
-                    ri = nodes[k]['row_idx']
-                    if ri not in seen_src:
-                        group_src_rows.append(rows_f[ri])
-                        seen_src.add(ri)
-                    to_remove.add(ri)
-
-                # also ensure the winning candidate's own source is removed
-                to_remove.add(best['src_idx'])
-
-                # store kept candidate along with all contributing old rows
-                kept_cands.append({
-                    'new_cx': best['new_cx'], 'new_cy': best['new_cy'],
-                    'side': best['side'], 'weight': best['weight'],
-                    'src_idx': best['src_idx'], 'src_row': best['src_row'],
-                    'group_src_rows': group_src_rows,
-                    'group_id': int(root),
-                })
-
-        metrics['old_rows_removed'] += len(to_remove)
-
-        # Build frame rows: keep everything not removed, then append replacements
-        frame_out_rows: List[dict] = []
-        for i, r in enumerate(rows_f):
-            if i in to_remove:
-                continue
-            frame_out_rows.append(r)
-
-        for g in kept_cands:
-            src = dict(g['src_row'])
-            src['x']  = float(g['new_cx'])
-            src['y']  = float(g['new_cy'])
-            src['w']  = int(g['side'])
-            src['h']  = int(g['side'])
-            src['xy_semantics'] = 'center'
-            frame_out_rows.append(src)
-
-        # Save crops for each kept replacement — each in its own folder
-        for g in kept_cands:
-            src = g['src_row']
-            # collect old crop metadata from all contributing rows
-            old_crops_data = []
-            for orow in g['group_src_rows']:
-                try:
-                    ow = int(round(float(orow.get('w', 10)))); oh = int(round(float(orow.get('h', 10))))
-                    if has_xy_sem and str(orow.get('xy_semantics','')).lower() == 'center':
-                        ocx = float(orow['x']); ocy = float(orow['y'])
-                    else:
-                        ocx = float(orow['x']) + ow/2.0; ocy = float(orow['y']) + oh/2.0
-                except Exception:
-                    continue
-                ox0 = int(round(ocx - ow/2.0)); oy0 = int(round(ocy - oh/2.0))
-                ox0 = max(0, min(ox0, W - ow)); oy0 = max(0, min(oy0, H - oh))
-                old_crop = frame[oy0:oy0+oh, ox0:ox0+ow]
-                old_crops_data.append({
-                    'crop': old_crop, 'x0': ox0, 'y0': oy0, 'w': ow, 'h': oh,
-                    'cx': ocx, 'cy': ocy
-                })
-
-            # new crop (center semantics)
-            ns = int(g['side'])
-            ncx, ncy = float(g['new_cx']), float(g['new_cy'])
-            nx0 = int(round(ncx - ns/2.0)); ny0 = int(round(ncy - ns/2.0))
-            nx0 = max(0, min(nx0, W - ns)); ny0 = max(0, min(ny0, H - ns))
-            new_crop = frame[ny0:ny0+ns, nx0:nx0+ns]
-
-            # build folder and filenames with details
-            bg = src.get('background_logit', '')
-            ff = src.get('firefly_logit', '')
-            conf = src.get('firefly_confidence', '')
-            ncxi, ncyi = int(round(ncx)), int(round(ncy))
-            base = f"t{fr:06d}_new_x{ncxi}_y{ncyi}_{ns}x{ns}_thr{int(neighbor_intensity_threshold)}"
-            if ff != '' or bg != '':
-                base += f"_ff{ff}_bg{bg}"
-            if conf != '':
-                base += f"_conf{conf}"
-
-            out_folder = out_root / base
-            _ensure_dir(out_folder)
-
-            # save all old crops (each file carries its own details)
-            for k, d in enumerate(old_crops_data):
-                ocxi, ocyi = int(round(d['cx'])), int(round(d['cy']))
-                ow, oh = d['w'], d['h']
-                old_path = out_folder / f"OLD_{k:02d}_x{ocxi}_y{ocyi}_{ow}x{oh}.png"
-                cv2.imwrite(str(old_path), d['crop'])
-
-            # save new crop
-            new_path = out_folder / f"NEW_x{ncxi}_y{ncyi}_{ns}x{ns}.png"
-            cv2.imwrite(str(new_path), new_crop)
-
-            # 100x100 annotated context crop (new=green, old=red)
-            annot = frame.copy()
-            cv2.rectangle(annot, (nx0, ny0), (nx0+ns-1, ny0+ns-1), (0,255,0), _ANNOTATION_BOX_THICKNESS)
-            for d in old_crops_data:
-                ox0, oy0, ow, oh = d['x0'], d['y0'], d['w'], d['h']
-                cv2.rectangle(annot, (ox0, oy0), (ox0+ow-1, oy0+oh-1), (0,0,255), _ANNOTATION_BOX_THICKNESS)
-
-            xs = [nx0, nx0+ns-1] + [d['x0'] for d in old_crops_data] + [d['x0']+d['w']-1 for d in old_crops_data]
-            ys = [ny0, ny0+ns-1] + [d['y0'] for d in old_crops_data] + [d['y0']+d['h']-1 for d in old_crops_data]
-            if xs and ys:
-                bx0, bx1 = max(0, min(xs)), min(W-1, max(xs))
-                by0, by1 = max(0, min(ys)), min(H-1, max(ys))
-                bc_x = (bx0 + bx1) / 2.0
-                bc_y = (by0 + by1) / 2.0
-            else:
-                bc_x, bc_y = ncx, ncy
-
-            ctx_side = 100
-            ctx_s = min(ctx_side, W, H)
-            cx0 = int(round(bc_x - ctx_s/2.0))
-            cy0 = int(round(bc_y - ctx_s/2.0))
-            cx0 = max(0, min(cx0, W - ctx_s))
-            cy0 = max(0, min(cy0, H - ctx_s))
-            context = annot[cy0:cy0+ctx_s, cx0:cx0+ctx_s]
-
-            ctx_path = out_folder / ("CONTEXT_100.png" if ctx_s == 100 else f"CONTEXT_{ctx_s}.png")
-            cv2.imwrite(str(ctx_path), context)
-
-        metrics['replaced']          += len(kept_cands)
-        metrics['new_rows_inserted'] += len(kept_cands)
+        frame_out_rows = expand_frame_rows(
+            frame, fr, rows_f,
+            has_class=has_class, has_xy_sem=has_xy_sem,
+            neighbor_intensity_threshold=neighbor_intensity_threshold,
+            dedupe_dist_px=dedupe_dist_px,
+            min_square_area_px=min_square_area_px,
+            gaussian_sigma=gaussian_sigma,
+            out_root=out_root, metrics=metrics,
+        )
 
         # append to global list
         new_all_rows.extend(frame_out_rows)

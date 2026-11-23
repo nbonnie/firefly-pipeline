@@ -122,6 +122,15 @@ The underlying pipelines normally run pre-run cleanup. The gateway disables clea
 
 For repeatable production-style runs, use `--max-concurrent 1` first. Increase concurrency only after validating output isolation and GPU memory.
 
+### Night Queues
+
+With `NIGHT_STAGE1_QUEUE = True` (the default) night videos go through two queues, each step in its own subprocess:
+
+1. Stage 1 (the GPU stage) runs for one video at a time, in input order.
+2. A video that has finished Stage 1 moves to the second queue, where the remaining stages (CPU) run for up to `--max-concurrent` videos at once while the GPU starts Stage 1 of the next video.
+
+`--max-concurrent` therefore counts videos in the remaining stages; Stage 1 is always one more process. Set `NIGHT_STAGE1_QUEUE = False` to run whole night pipelines side by side as before.
+
 ## Model Overrides
 
 The gateway dynamically overrides:

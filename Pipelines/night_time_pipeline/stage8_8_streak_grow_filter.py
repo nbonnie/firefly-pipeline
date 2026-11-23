@@ -8,11 +8,13 @@ from typing import Optional, List, Dict, Tuple
 import cv2
 import numpy as np
 
+from frame_reader import frame_chunks, read_ahead
 from local_contrast import ring_contrast
 
 MAX_EXTRAPOLATION_SPEED_PX = 2.0
 MIN_POINTS_FOR_VELOCITY = 4
 SUPPORT_FRAC = 0.2
+READ_CHUNK_FRAMES = 16
 
 _BAR = 50
 def _progress(i, total, tag=''):
@@ -103,14 +105,14 @@ def _flash_runs(con: np.ndarray, grow_contrast: float, max_gap: int) -> List[Tup
     ends = np.r_[idx[cuts], idx[-1]]
     return list(zip(starts.tolist(), ends.tolist()))
 
-def _curve_shape(sig: np.ndarray, a: int, b: int, margin: int) -> Tuple[int, float]:
+def _curve_shape(sig: np.ndarray, a: int, b: int, margin: int) -> Tuple[int, int, float]:
     lo = max(0, a - margin)
     hi = min(len(sig) - 1, b + margin)
     seg = np.clip(sig[lo:hi + 1], 0, None)
     ip = (a - lo) + int(np.argmax(seg[a - lo:b - lo + 1]))
     peak = float(seg[ip])
     if peak <= 0:
-        return 0, 1.0
+        return 0, 0, 1.0
 
     def _run(th):
         i = j = ip
@@ -124,7 +126,8 @@ def _curve_shape(sig: np.ndarray, a: int, b: int, margin: int) -> Tuple[int, flo
     si, sj = _run(peak * SUPPORT_FRAC)
     outside = np.r_[seg[:si], seg[sj + 1:]]
     base = float(np.median(outside)) / peak if len(outside) >= 3 else 1.0
-    return j - i + 1, base
+    above = int((seg[a - lo:b - lo + 1] >= peak / 2.0).sum())
+    return j - i + 1, above, base
 
 def stage8_8_grow_and_filter_streaks(
     *,
@@ -137,6 +140,7 @@ def stage8_8_grow_and_filter_streaks(
     grow_frames: int = 15,
     max_frame_gap: int = 2,
     min_width_frames: int = 2,
+    min_flicker_frames: int = 3,
     max_base_frac: float = 0.35,
     max_streak_seconds: float = 3.0,
     dedupe_px: float = 4.0,
@@ -148,6 +152,8 @@ def stage8_8_grow_and_filter_streaks(
     """
     Links firefly rows into streaks, grows each streak in time down to grow_contrast,
     and keeps only flashes that are bright enough, short enough, wide enough and not flat.
+    A flash is wide enough if it stays above half its peak for min_width_frames in a row,
+    or reaches that level in min_flicker_frames frames overall (flashes that flicker).
 
     Returns: (fireflies_before, fireflies_after, rows_added_by_growing)
     """
@@ -204,19 +210,16 @@ def stage8_8_grow_and_filter_streaks(
             by_frame[start + k].append((sid, k, px[k], py[k]))
 
     last_needed = max(by_frame) if by_frame else -1
-    fr = 0
-    while fr <= last_needed:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        todo = by_frame.get(fr)
-        if todo:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            for sid, k, x, y in todo:
-                sig, con, bx, by = ring_contrast(gray, x, y)
-                t = tracks[sid]
-                t['sig'][k] = sig; t['con'][k] = con; t['x'][k] = bx; t['y'][k] = by
-        _progress(fr + 1, last_needed + 1, 'stage8.8-grow'); fr += 1
+    for first, frames in read_ahead(frame_chunks(cap, READ_CHUNK_FRAMES, last_needed + 1)):
+        for fr, frame in enumerate(frames, first):
+            todo = by_frame.get(fr)
+            if todo:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                for sid, k, x, y in todo:
+                    sig, con, bx, by = ring_contrast(gray, x, y)
+                    t = tracks[sid]
+                    t['sig'][k] = sig; t['con'][k] = con; t['x'][k] = bx; t['y'][k] = by
+        _progress(first + len(frames), last_needed + 1, 'stage8.8-grow')
     cap.release()
 
     taken_by_frame: Dict[int, List[Tuple[float, float]]] = defaultdict(list)
@@ -236,7 +239,7 @@ def stage8_8_grow_and_filter_streaks(
             if not seeds:
                 continue
             peak_con = float(t['con'][a:b + 1].max())
-            width, base = _curve_shape(t['sig'], a, b, grow_frames)
+            width, above, base = _curve_shape(t['sig'], a, b, grow_frames)
             length = b - a + 1
 
             reason = ''
@@ -244,7 +247,7 @@ def stage8_8_grow_and_filter_streaks(
                 reason = 'weak'
             elif length > max_len:
                 reason = 'too_long'
-            elif width < int(min_width_frames):
+            elif width < int(min_width_frames) and above < int(min_flicker_frames):
                 reason = 'too_narrow'
             elif base > float(max_base_frac):
                 reason = 'flat'
@@ -282,6 +285,7 @@ def stage8_8_grow_and_filter_streaks(
                 'n_grown': grown,
                 'peak_contrast': round(peak_con, 2),
                 'width_frames': width,
+                'frames_above_half': above,
                 'base_frac': round(base, 3),
                 'length_frames': length,
                 'kept': int(not reason),
@@ -297,7 +301,7 @@ def stage8_8_grow_and_filter_streaks(
 
     if report_csv_path is not None:
         report_cols = ['flash_id', 't_start', 't_end', 'x', 'y', 'n_seed', 'n_grown', 'peak_contrast',
-                       'width_frames', 'base_frac', 'length_frames', 'kept', 'reason']
+                       'width_frames', 'frames_above_half', 'base_frac', 'length_frames', 'kept', 'reason']
         _write_csv_rows(Path(report_csv_path), report, report_cols)
 
     before = len(det_idx)

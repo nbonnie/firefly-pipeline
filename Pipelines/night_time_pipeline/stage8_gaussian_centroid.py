@@ -91,6 +91,76 @@ def _infer_firefly_conf(row: dict) -> float:
 # ──────────────────────────────────────────────────────────────
 # Stage-8 main entry point
 
+def refine_frame_rows(frame, fr, dets, patch_w, patch_h, gaussian_sigma, out_rows, firefly_rows):
+    for r in dets:
+        # current center from row's box (may still be top-left semantics from earlier stages)
+        x, y, w, h = int(float(r['x'])), int(float(r['y'])), int(float(r['w'])), int(float(r['h']))
+        cx = x + w/2.0
+        cy = y + h/2.0
+
+        # small crop to compute centroid
+        crop, x0, y0 = _center_crop_clamped(frame, cx, cy, patch_w, patch_h)
+        if crop.size == 0:
+            continue
+        crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        ccx, ccy = _intensity_centroid(crop_gray, gaussian_sigma)
+
+        # translate to image coords (centroid)
+        new_cx = x0 + ccx
+        new_cy = y0 + ccy
+
+        # Set center semantics with a fixed 10×10 box for downstream
+        FIX_W = 10; FIX_H = 10
+        out = dict(r)
+        out['x'] = float(new_cx)
+        out['y'] = float(new_cy)
+        out['w'] = FIX_W
+        out['h'] = FIX_H
+        out['xy_semantics'] = 'center'
+        out_rows.append(out)
+
+        # Collect for fireflies-only CSV (t = zero-based frame)
+        if out.get('class') == 'firefly' and ('background_logit' in out or 'firefly_logit' in out):
+            bg = _parse_float_safe(out.get('background_logit', 0.0), 0.0)
+            ff = _parse_float_safe(out.get('firefly_logit', 0.0), 0.0)
+            firefly_rows.append((float(new_cx), float(new_cy), fr, bg, ff))
+
+def save_frame_crops(frame, fr, rows_f, has_xy_sem, crop_dir) -> int:
+    saved = 0
+    for r in rows_f:
+        try:
+            w = int(float(r['w'])); h = int(float(r['h']))
+            if has_xy_sem and str(r.get('xy_semantics','')).lower() == 'center':
+                cx = float(r['x']); cy = float(r['y'])
+            else:
+                cx = float(r['x']) + w/2.0
+                cy = float(r['y']) + h/2.0
+
+            crop, x0, y0 = _center_crop_clamped(frame, cx, cy, w, h)
+            crop = crop.copy()
+
+            # Paint center pixel in red (BGR)
+            px = int(round(cx - x0))
+            py = int(round(cy - y0))
+            if 0 <= py < crop.shape[0] and 0 <= px < crop.shape[1]:
+                crop[py, px] = (0, 0, 255)
+
+            # Determine firefly confidence for filename
+            conf = _infer_firefly_conf(r)
+            # Format to 4 decimals; if NaN, write 'nan'
+            conf_str = f"{conf:.4f}" if conf == conf else "nan"
+
+            if crop.shape[0] == h and crop.shape[1] == w:
+                out_name = (
+                    f"stage8_frame_{fr:06d}_x{int(round(cx))}_y{int(round(cy))}"
+                    f"_{w}x{h}_conf{conf_str}.png"
+                )
+                cv2.imwrite(str(crop_dir / out_name), crop)
+                saved += 1
+        except Exception:
+            continue
+    return saved
+
 def recenter_gaussian_centroid(
     orig_video_path: Path,
     csv_path: Path,
@@ -173,38 +243,7 @@ def recenter_gaussian_centroid(
             _progress(fr+1, total_frames, 'stage8'); fr += 1
             continue
 
-        for r in dets:
-            # current center from row's box (may still be top-left semantics from earlier stages)
-            x, y, w, h = int(float(r['x'])), int(float(r['y'])), int(float(r['w'])), int(float(r['h']))
-            cx = x + w/2.0
-            cy = y + h/2.0
-
-            # small crop to compute centroid
-            crop, x0, y0 = _center_crop_clamped(frame, cx, cy, centroid_patch_w, centroid_patch_h)
-            if crop.size == 0:
-                continue
-            crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            ccx, ccy = _intensity_centroid(crop_gray, gaussian_sigma)
-
-            # translate to image coords (centroid)
-            new_cx = x0 + ccx
-            new_cy = y0 + ccy
-
-            # Set center semantics with a fixed 10×10 box for downstream
-            FIX_W = 10; FIX_H = 10
-            out = dict(r)
-            out['x'] = float(new_cx)
-            out['y'] = float(new_cy)
-            out['w'] = FIX_W
-            out['h'] = FIX_H
-            out['xy_semantics'] = 'center'
-            out_rows.append(out)
-
-            # Collect for fireflies-only CSV (t = zero-based frame)
-            if out.get('class') == 'firefly' and ('background_logit' in out or 'firefly_logit' in out):
-                bg = _parse_float_safe(out.get('background_logit', 0.0), 0.0)
-                ff = _parse_float_safe(out.get('firefly_logit', 0.0), 0.0)
-                firefly_rows.append((float(new_cx), float(new_cy), fr, bg, ff))
+        refine_frame_rows(frame, fr, dets, centroid_patch_w, centroid_patch_h, gaussian_sigma, out_rows, firefly_rows)
 
         _progress(fr+1, total_frames, 'stage8'); fr += 1
 
@@ -266,37 +305,7 @@ def recenter_gaussian_centroid(
                 break
 
             rows_f = by_frame_firefly.get(fr, [])
-            for r in rows_f:
-                try:
-                    w = int(float(r['w'])); h = int(float(r['h']))
-                    if has_xy_sem and str(r.get('xy_semantics','')).lower() == 'center':
-                        cx = float(r['x']); cy = float(r['y'])
-                    else:
-                        cx = float(r['x']) + w/2.0
-                        cy = float(r['y']) + h/2.0
-
-                    crop, x0, y0 = _center_crop_clamped(frame, cx, cy, w, h)
-
-                    # Paint center pixel in red (BGR)
-                    px = int(round(cx - x0))
-                    py = int(round(cy - y0))
-                    if 0 <= py < crop.shape[0] and 0 <= px < crop.shape[1]:
-                        crop[py, px] = (0, 0, 255)
-
-                    # Determine firefly confidence for filename
-                    conf = _infer_firefly_conf(r)
-                    # Format to 4 decimals; if NaN, write 'nan'
-                    conf_str = f"{conf:.4f}" if conf == conf else "nan"
-
-                    if crop.shape[0] == h and crop.shape[1] == w:
-                        out_name = (
-                            f"stage8_frame_{fr:06d}_x{int(round(cx))}_y{int(round(cy))}"
-                            f"_{w}x{h}_conf{conf_str}.png"
-                        )
-                        cv2.imwrite(str(crop_dir / out_name), crop)
-                        saved += 1
-                except Exception:
-                    continue
+            saved += save_frame_crops(frame, fr, rows_f, has_xy_sem, crop_dir)
 
             _progress(fr+1, total_video_frames, 'stage8-crops'); fr += 1
 

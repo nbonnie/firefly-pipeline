@@ -60,7 +60,7 @@ RUN_STAGE6 = True
 RUN_STAGE7 = True
 RUN_STAGE8 = True
 RUN_STAGE8_5 = True
-RUN_STAGE8_6 = True
+RUN_STAGE8_6 = False
 RUN_STAGE8_7 = True
 RUN_STAGE8_8 = True
 RUN_STAGE8_9 = True
@@ -71,6 +71,18 @@ RUN_STAGE11 = True
 RUN_STAGE12 = True
 RUN_STAGE14 = True
 ```
+
+Run structure:
+
+```python
+PIPELINE_PHASE = 'all'
+SINGLE_DECODE_PASS = True
+SINGLE_PASS_CHUNK_FRAMES = 16
+```
+
+- `PIPELINE_PHASE`: `'detect'` runs cleanup and Stage 1 only, `'post'` runs everything after Stage 1 on the CSV a `'detect'` run left behind. The gateway sets these for its two night queues.
+- `SINGLE_DECODE_PASS`: stages 2 to 8.7 share one pass over the video. Needs `RUN_STAGE8_6 = False` and stages 2, 3, 4, 7, 8, 8.5, 8.7 all on; otherwise each stage reads the video itself.
+- `SINGLE_PASS_CHUNK_FRAMES`: frames decoded ahead and classified together in that pass. Three chunks are held in memory (about 25 MB per 4K frame).
 
 For fast debugging, it is common to temporarily disable render/analysis stages:
 
@@ -203,7 +215,7 @@ STAGE8_7_DEDUPE_PX = 10.0
 STAGE8_7_MIN_SQUARE_AREA_PX = 75
 ```
 
-Stage 8.6 improves recall around masked existing detections.
+Stage 8.6 improves recall around masked existing detections. It is off by default: with the Stage 2 contrast gate and Stage 8.8 it took about two thirds of the run time on a 4K video and almost none of its additions survived Stage 8.8. Set `RUN_STAGE8_6 = True` to turn it back on.
 
 Stage 8.7 repairs large flashes that were split into smaller shards.
 
@@ -215,6 +227,7 @@ STAGE8_8_LINK_RADIUS_PX = 12.0
 STAGE8_8_GROW_FRAMES = 15
 STAGE8_8_MAX_FRAME_GAP = 2
 STAGE8_8_MIN_WIDTH_FRAMES = 2
+STAGE8_8_MIN_FLICKER_FRAMES = 3
 STAGE8_8_MAX_BASE_FRAC = 0.35
 STAGE8_8_MAX_STREAK_SECONDS = 3.0
 STAGE8_8_DEDUPE_PX = 4.0
@@ -224,6 +237,7 @@ Stage 8.8 grows each seed streak down to the grow contrast and then keeps only f
 
 - Lower `STAGE8_8_GROW_CONTRAST_THRESHOLD` to follow flash tails further into the noise.
 - `STAGE8_8_MIN_WIDTH_FRAMES = 2` removes single-frame blips such as hot pixels. Use `1` for species whose flashes last one frame.
+- `STAGE8_8_MIN_FLICKER_FRAMES = 3` keeps flashes that flicker: they never hold half their peak for two frames in a row, but reach it in at least this many frames.
 - Raise `STAGE8_8_MAX_STREAK_SECONDS` for species with long glows.
 - `STAGE8_8_GROW_FRAMES` limits how far a tail is followed and how far apart two seeds of one flash may be.
 

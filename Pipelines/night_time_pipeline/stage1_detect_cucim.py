@@ -17,6 +17,8 @@ os.environ.setdefault('CUPY_DUMP_CUDA_SOURCE_ON_ERROR', '1')
 import cv2
 import numpy as np
 
+from frame_reader import read_ahead
+
 try:
     import cupy as cp
     from cupyx.scipy import ndimage as cnd
@@ -402,12 +404,6 @@ def _make_clahe(use: bool, clip: float, tile: int | tuple[int, int]):
     return cv2.createCLAHE(clipLimit=float(clip), tileGridSize=(tx, ty))
 
 
-def _apply_clahe(gray: np.ndarray, clahe) -> np.ndarray:
-    if clahe is None:
-        return gray
-    return clahe.apply(gray)
-
-
 def _sigma_to_radius(detector: str, sigma_val: float, log_scale: bool) -> float:
     name = detector.lower()
     if name == "log":
@@ -552,7 +548,6 @@ def detect_stage1_to_csv(
     clahe = _make_clahe(use_clahe, clahe_clip, clahe_tile)
 
     rows: list[tuple[int, int, int, int, int]] = []
-    frame_idx = 0
 
     # Normalize and validate batch size
     try:
@@ -577,7 +572,7 @@ def detect_stage1_to_csv(
 
     use_fallback_log = False
 
-    def _process_gray_batch(gray_batch: list[np.ndarray], idx_batch: list[int]) -> None:
+    def _process_gray_batch(gray_batch: np.ndarray, idx_batch: list[int]) -> None:
         """
         Process a batch of grayscale frames.
 
@@ -586,14 +581,14 @@ def detect_stage1_to_csv(
         """
         gpu_batch = None
         try:
-            # Upload: (N,H,W) float32 in [0,1]. Keep normalization in-place to
-            # avoid doubling peak GPU memory.
-            gpu_batch = cp.asarray(np.stack(gray_batch, axis=0), dtype=cp.float32)
-            gpu_batch *= (1.0 / 255.0)
+            # Upload the batch as uint8 (a quarter of the float32 size) and convert
+            # each frame to float32 in [0,1] on the GPU; the values are identical.
+            gpu_batch = cp.asarray(gray_batch)
 
             # Run cuCIM detector per-slice (API is 2D); keep results identical to per-frame path.
             for bi, fidx in enumerate(idx_batch):
-                gpu_img = gpu_batch[bi]
+                gpu_img = gpu_batch[bi].astype(cp.float32)
+                gpu_img *= (1.0 / 255.0)
 
                 if detector == "log":
                     try:
@@ -697,33 +692,44 @@ def detect_stage1_to_csv(
                 except Exception:
                     pass
 
-    while True:
-        # Stop if we've reached the requested maximum frames
-        if max_frames is not None and frame_idx >= max_frames:
-            break
+    def _read_gray_batches():
+        # Decoding runs in a background thread (see read_ahead) while the GPU works on
+        # the previous batch. Batches are written into three buffers used in turn, so
+        # no new memory is allocated per batch.
+        ring = None
+        frame = None
+        gray = None
+        frame_idx = 0
+        k = 0
+        while True:
+            idx_batch: list[int] = []
+            while len(idx_batch) < batch_n:
+                if max_frames is not None and frame_idx >= max_frames:
+                    break
+                ok, frame = cap.read() if frame is None else cap.read(frame)
+                if not ok:
+                    break
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY, gray)
+                if ring is None:
+                    ring = [np.empty((batch_n,) + gray.shape, dtype=np.uint8) for _ in range(3)]
+                out = ring[k % 3][len(idx_batch)]
+                if clahe is None:
+                    out[...] = gray
+                else:
+                    clahe.apply(gray, out)
+                idx_batch.append(frame_idx)
+                frame_idx += 1
 
-        # Read up to batch_n frames
-        gray_batch: list[np.ndarray] = []
-        idx_batch: list[int] = []
-        for _ in range(batch_n):
-            if max_frames is not None and frame_idx >= max_frames:
-                break
-            ok, frame = cap.read()
-            if not ok:
-                break
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            gray = _apply_clahe(gray, clahe)
-            gray_batch.append(gray)
-            idx_batch.append(frame_idx)
-            frame_idx += 1
+            if not idx_batch:
+                return
+            yield ring[k % 3][:len(idx_batch)], idx_batch
+            k += 1
 
-        if not gray_batch:
-            break
-
+    for gray_batch, idx_batch in read_ahead(_read_gray_batches()):
         _process_gray_batch(gray_batch, idx_batch)
 
         # Update progress by batch
-        progress(min(frame_idx, total_frames), total_frames, 'detect(cuCIM)')
+        progress(min(idx_batch[-1] + 1, total_frames), total_frames, 'detect(cuCIM)')
 
     cap.release()
 

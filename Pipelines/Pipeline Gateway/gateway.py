@@ -9,6 +9,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 # -----------------------------------------------------------------------------
 # User-configurable globals (defaults; CLI args can override)
@@ -47,6 +48,11 @@ DRY_RUN: bool = False
 # Max videos to process concurrently (each video runs in its own subprocess).
 MAX_CONCURRENT_VIDEOS: int = 2
 
+# Night videos go through two queues: Stage 1 (GPU) runs for one video at a time, and a
+# video that has finished Stage 1 moves on to the remaining stages (CPU), which run for
+# up to MAX_CONCURRENT_VIDEOS videos at once. Set False to run whole pipelines side by side.
+NIGHT_STAGE1_QUEUE: bool = True
+
 # Optional model overrides (passed into the pipelines; only applied when set).
 # - For day pipeline: overrides params.PATCH_MODEL_PATH (+ STAGE5_MODEL_PATH for FN scoring)
 #   and params.YOLO_MODEL_WEIGHTS.
@@ -73,6 +79,14 @@ class RunningJob:
     video_path: Path
     route: str
     proc: subprocess.Popen
+    phase: str = "all"
+    start_phase: Callable[[str], subprocess.Popen] | None = None
+
+
+@dataclass(frozen=True)
+class QueuedNightVideo:
+    video_path: Path
+    start_phase: Callable[[str], subprocess.Popen]
 
 
 def _gt_csv_candidates(video_path: Path, *, route: str, out_base: Path | None) -> list[Path]:
@@ -276,8 +290,8 @@ def _day_pipeline_code(
             f"force_tests = {bool(force_tests)}",
             f"force_no_cleanup = {bool(force_no_cleanup)}",
             f"force_all_frames = {bool(FORCE_ALL_FRAMES)}",
-            f"max_frames_override = {int(max_frames_override)} if {max_frames_override is not None} else None",
-            f"gt_t_offset_override = {int(gt_t_offset_override)} if {gt_t_offset_override is not None} else None",
+            f"max_frames_override = {int(max_frames_override) if max_frames_override is not None else None}",
+            f"gt_t_offset_override = {int(gt_t_offset_override) if gt_t_offset_override is not None else None}",
             "if output_root is not None:",
             "    root = output_root",
             "    root.mkdir(parents=True, exist_ok=True)",
@@ -346,18 +360,20 @@ def _night_pipeline_code(
     force_no_cleanup: bool,
     max_frames_override: int | None,
     gt_t_offset_override: int | None,
+    phase: str = "all",
 ) -> str:
     return "\n".join(
         [
             "from pathlib import Path",
             "import pipeline_params as pp",
+            f"pp.PIPELINE_PHASE = {phase!r}",
             f"output_root = Path({repr(str(output_root))}).expanduser().resolve() if {output_root is not None} else None",
             f"cnn_model_path = Path({repr(str(cnn_model_path))}).expanduser().resolve() if {cnn_model_path is not None} else None",
             f"force_tests = {bool(force_tests)}",
             f"force_no_cleanup = {bool(force_no_cleanup)}",
             f"force_all_frames = {bool(FORCE_ALL_FRAMES)}",
-            f"max_frames_override = {int(max_frames_override)} if {max_frames_override is not None} else None",
-            f"gt_t_offset_override = {int(gt_t_offset_override)} if {gt_t_offset_override is not None} else None",
+            f"max_frames_override = {int(max_frames_override) if max_frames_override is not None else None}",
+            f"gt_t_offset_override = {int(gt_t_offset_override) if gt_t_offset_override is not None else None}",
             "if output_root is not None:",
             "    root = output_root",
             "    root.mkdir(parents=True, exist_ok=True)",
@@ -496,15 +512,17 @@ def _start_night_pipeline(
     force_no_cleanup: bool,
     max_frames_override: int | None,
     gt_t_offset_override: int | None,
+    phase: str = "all",
 ) -> subprocess.Popen:
     code = _night_pipeline_code(
         video_path,
         output_root=output_root,
         cnn_model_path=cnn_model_path,
         force_tests=force_tests,
-        force_no_cleanup=force_no_cleanup,
+        force_no_cleanup=force_no_cleanup or phase == "post",
         max_frames_override=max_frames_override,
         gt_t_offset_override=gt_t_offset_override,
+        phase=phase,
     )
     return _start_subprocess_python(code, cwd=pipeline.night_dir)
 
@@ -612,6 +630,24 @@ def main() -> int:
     night_cleanup_done = False
 
     running: list[RunningJob] = []
+    stage1_queue: list[QueuedNightVideo] = []
+    post_queue: list[QueuedNightVideo] = []
+    use_night_queues = bool(NIGHT_STAGE1_QUEUE)
+
+    def _slots_used() -> int:
+        return sum(1 for job in running if job.phase != "detect")
+
+    def _start_queued() -> None:
+        while post_queue and _slots_used() < max_concurrent:
+            item = post_queue.pop(0)
+            proc = item.start_phase("post")
+            running.append(RunningJob(item.video_path, "night", proc, "post", item.start_phase))
+            print(f"[gateway] started  {item.video_path.name}  route=night  remaining stages  pid={proc.pid}")
+        if stage1_queue and not any(job.phase == "detect" for job in running):
+            item = stage1_queue.pop(0)
+            proc = item.start_phase("detect")
+            running.append(RunningJob(item.video_path, "night", proc, "detect", item.start_phase))
+            print(f"[gateway] started  {item.video_path.name}  route=night  stage 1  pid={proc.pid}")
 
     def _reap_one(*, block: bool) -> None:
         while True:
@@ -620,11 +656,16 @@ def main() -> int:
                 if rc is None:
                     continue
                 running.pop(i)
-                print(f"[gateway] finished {job.video_path.name}  route={job.route}  exit={int(rc)}")
-                if int(rc) != 0:
-                    failures.append((job.video_path, int(rc)))
+                if job.phase == "detect" and int(rc) == 0:
+                    print(f"[gateway] stage 1 done {job.video_path.name}  queued for the remaining stages")
+                    post_queue.append(QueuedNightVideo(job.video_path, job.start_phase))
+                else:
+                    print(f"[gateway] finished {job.video_path.name}  route={job.route}  exit={int(rc)}")
+                    if int(rc) != 0:
+                        failures.append((job.video_path, int(rc)))
+                _start_queued()
                 return
-            if not block:
+            if not block or not running:
                 return
             time.sleep(0.2)
 
@@ -688,7 +729,37 @@ def main() -> int:
             if bool(args.dry_run):
                 continue
 
-            while len(running) >= max_concurrent:
+            if route == "night" and use_night_queues:
+                night_root = (out_base / NIGHT_OUTPUT_SUBDIR) if out_base is not None else None
+                force_no_cleanup = (max_concurrent > 1) or night_cleanup_done
+
+                def _start_phase(
+                    phase: str,
+                    video=video,
+                    night_root=night_root,
+                    force_no_cleanup=force_no_cleanup,
+                    max_frames_override=max_frames_override,
+                    gt_t_offset_override=gt_t_offset_override,
+                ) -> subprocess.Popen:
+                    return _start_night_pipeline(
+                        video,
+                        pipeline=pipeline,
+                        output_root=night_root,
+                        cnn_model_path=night_cnn_model,
+                        force_tests=force_tests,
+                        force_no_cleanup=force_no_cleanup,
+                        max_frames_override=max_frames_override,
+                        gt_t_offset_override=gt_t_offset_override,
+                        phase=phase,
+                    )
+
+                night_cleanup_done = True
+                stage1_queue.append(QueuedNightVideo(video, _start_phase))
+                _start_queued()
+                _reap_one(block=False)
+                continue
+
+            while _slots_used() >= max_concurrent:
                 _reap_one(block=True)
 
             try:
@@ -730,7 +801,8 @@ def main() -> int:
             print(f"[gateway] started  {video.name}  route={route}  pid={proc.pid}")
             _reap_one(block=False)
 
-        while running:
+        while running or stage1_queue or post_queue:
+            _start_queued()
             _reap_one(block=True)
     except KeyboardInterrupt:
         print("\n[gateway] Interrupted; terminating running jobs…")

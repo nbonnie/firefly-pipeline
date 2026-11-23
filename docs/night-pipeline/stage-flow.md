@@ -38,6 +38,21 @@ source video
 
 The orchestrator runs stages in the actual order above. Stage 10 overlays run after Stage 14 in the code, even though the stage number is lower, because overlays need Stage 9 validation outputs.
 
+### Passes Over The Video
+
+Decoding the video is the most expensive part of most stages, so the default run reads it three times instead of once per stage:
+
+```text
+pass 1  Stage 1                                   (stage1_detect_cucim.py)
+pass 2  Stages 2, 3, 4, 7, 8, 8.5, 8.7, 8.5       (stage2_to_8_7_single_pass.py)
+pass 3  Stage 8.8                                 (stage8_8_streak_grow_filter.py)
+```
+
+- Pass 2 sends every frame through the same per-frame functions the separate stage files use, in the same order. The main CSV, the area snapshot, the Stage 8 crops and the Stage 8.7 replacement folders are the same as with separate stages. The classifier runs once per chunk of frames instead of once per `NUM_PATCHES_BATCH_SIZE` patches, so logits can differ in the third decimal.
+- All three passes decode in a background thread into reused frame buffers (`frame_reader.py`) while the previous frames are processed.
+- `SINGLE_DECODE_PASS = False`, `RUN_STAGE8_6 = True` or switching off any of the stages in pass 2 falls back to one pass per stage.
+- When Stage 5 or 6 rendering is on, pass 2 also writes `<stem>_after_stage4.csv`, which the renderers read in place of the main CSV.
+
 ## Stage 0 - Cleanup
 
 File:
@@ -430,7 +445,7 @@ Purpose:
 - Links firefly rows (the seeds that passed Stage 2) into streaks. A streak is one flash, not a trajectory.
 - Reads the local contrast at each streak's position from `STAGE8_8_GROW_FRAMES` before its first seed to the same number after its last.
 - Grows each flash over the frames whose contrast is at least `STAGE8_8_GROW_CONTRAST_THRESHOLD`, adding firefly rows for the dim start and end.
-- Drops flashes that are longer than `STAGE8_8_MAX_STREAK_SECONDS`, narrower than `STAGE8_8_MIN_WIDTH_FRAMES` at half their peak, or flat (level just before and after above `STAGE8_8_MAX_BASE_FRAC` of the peak).
+- Drops flashes that are longer than `STAGE8_8_MAX_STREAK_SECONDS`, narrower than `STAGE8_8_MIN_WIDTH_FRAMES` at half their peak (unless at least `STAGE8_8_MIN_FLICKER_FRAMES` frames reach half the peak), or flat (level just before and after above `STAGE8_8_MAX_BASE_FRAC` of the peak).
 - Added rows copy the logits of the nearest seed in the same flash.
 - Writes one report row per flash with its measurements and the reason it was dropped.
 
@@ -441,6 +456,7 @@ Important parameters:
 - `STAGE8_8_GROW_FRAMES`
 - `STAGE8_8_MAX_FRAME_GAP`
 - `STAGE8_8_MIN_WIDTH_FRAMES`
+- `STAGE8_8_MIN_FLICKER_FRAMES`
 - `STAGE8_8_MAX_BASE_FRAC`
 - `STAGE8_8_MAX_STREAK_SECONDS`
 - `STAGE8_8_DEDUPE_PX`

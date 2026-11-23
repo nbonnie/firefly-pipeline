@@ -40,6 +40,56 @@ def _centroid_xy(r):
 def _euclid(a, b):
     return float(math.hypot(a[0]-b[0], a[1]-b[1]))
 
+def merge_frame_rows(frame, dets, W, H, dist_threshold_px) -> List[dict]:
+    n = len(dets)
+    kept_rows: List[dict] = []
+    # Precompute centroids and clamped boxes
+    centroids = []
+    boxes = []
+    for r in dets:
+        x, y, w, h = int(float(r['x'])), int(float(r['y'])), int(float(r['w'])), int(float(r['h']))
+        x, y, w, h = _clamp_box(x, y, w, h, W, H)
+        boxes.append((x,y,w,h))
+        centroids.append((x + w/2.0, y + h/2.0))
+
+    # Union-Find
+    parent = list(range(n))
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    def union(i, j):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    # Connect if within threshold
+    th = float(dist_threshold_px)
+    for i in range(n):
+        for j in range(i+1, n):
+            if _euclid(centroids[i], centroids[j]) <= th:
+                union(i, j)
+
+    # Buckets by root
+    groups: Dict[int, List[int]] = defaultdict(list)
+    for i in range(n):
+        groups[find(i)].append(i)
+
+    # For each group choose max-weight index
+    for root, idxs in groups.items():
+        max_w = -1.0; max_idx = idxs[0]
+        weights = {}
+        for i in idxs:
+            x,y,w,h = boxes[i]
+            wt = _rgb_weight(frame, x, y, w, h)
+            weights[i] = wt
+            if wt > max_w:
+                max_w = wt; max_idx = i
+        kept = dict(dets[max_idx])  # preserve all columns
+        kept_rows.append(kept)
+    return kept_rows
+
 def prune_overlaps_keep_heaviest_unionfind(
     orig_video_path: Path,
     csv_path: Path,
@@ -93,51 +143,7 @@ def prune_overlaps_keep_heaviest_unionfind(
             _progress(fr+1, max_frames or total_frames, 'stage7'); 
             continue
 
-        # Precompute centroids and clamped boxes
-        centroids = []
-        boxes = []
-        for r in dets:
-            x, y, w, h = int(float(r['x'])), int(float(r['y'])), int(float(r['w'])), int(float(r['h']))
-            x, y, w, h = _clamp_box(x, y, w, h, W, H)
-            boxes.append((x,y,w,h))
-            centroids.append((x + w/2.0, y + h/2.0))
-
-        # Union-Find
-        parent = list(range(n))
-        def find(i):
-            while parent[i] != i:
-                parent[i] = parent[parent[i]]
-                i = parent[i]
-            return i
-        def union(i, j):
-            ri, rj = find(i), find(j)
-            if ri != rj:
-                parent[ri] = rj
-
-        # Connect if within threshold
-        th = float(dist_threshold_px)
-        for i in range(n):
-            for j in range(i+1, n):
-                if _euclid(centroids[i], centroids[j]) <= th:
-                    union(i, j)
-
-        # Buckets by root
-        groups: Dict[int, List[int]] = defaultdict(list)
-        for i in range(n):
-            groups[find(i)].append(i)
-
-        # For each group choose max-weight index
-        for root, idxs in groups.items():
-            max_w = -1.0; max_idx = idxs[0]
-            weights = {}
-            for i in idxs:
-                x,y,w,h = boxes[i]
-                wt = _rgb_weight(frame, x, y, w, h)
-                weights[i] = wt
-                if wt > max_w:
-                    max_w = wt; max_idx = i
-            kept = dict(dets[max_idx])  # preserve all columns
-            out_rows.append(kept)
+        out_rows.extend(merge_frame_rows(frame, dets, W, H, dist_threshold_px))
 
         _progress(fr, max_frames or total_frames, 'stage7'); fr += 1
 

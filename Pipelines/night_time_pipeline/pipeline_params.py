@@ -44,7 +44,7 @@ RUN_STAGE6 = True
 RUN_STAGE7 = True
 RUN_STAGE8 = True
 RUN_STAGE8_5 = True
-RUN_STAGE8_6 = True
+RUN_STAGE8_6 = False
 RUN_STAGE8_7 = True
 RUN_STAGE8_8 = True
 RUN_STAGE8_9 = True
@@ -55,6 +55,9 @@ RUN_STAGE11 = True
 RUN_STAGE12 = True
 RUN_STAGE14 = True
 RUN_PRE_RUN_CLEANUP = True
+PIPELINE_PHASE = 'all'   # 'detect' = Stage 1 only, 'post' = everything after Stage 1 (the gateway queues use these)
+SINGLE_DECODE_PASS = True   # stages 2 to 8.7 share one pass over the video (needs RUN_STAGE8_6 = False)
+SINGLE_PASS_CHUNK_FRAMES = 16
 
 # Stage-1 variant selection
 STAGE1_VARIANT = 'cucim'
@@ -169,6 +172,7 @@ STAGE8_8_LINK_RADIUS_PX = 12.0
 STAGE8_8_GROW_FRAMES = 15
 STAGE8_8_MAX_FRAME_GAP = 2
 STAGE8_8_MIN_WIDTH_FRAMES = 2
+STAGE8_8_MIN_FLICKER_FRAMES = 3
 STAGE8_8_MAX_BASE_FRAC = 0.35
 STAGE8_8_MAX_STREAK_SECONDS = 3.0
 STAGE8_8_DEDUPE_PX = 4.0

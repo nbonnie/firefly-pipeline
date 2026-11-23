@@ -58,6 +58,76 @@ def _center_crop_clamped_bgr_to_pil(img_bgr, cx: float, cy: float, w: int, h: in
     rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
     return Image.fromarray(rgb)
 
+def load_classifier(model_path, backbone: str = 'resnet18', *,
+                    print_load_status: bool = True, fail_if_weights_missing: bool = True):
+    # Build model and load weights STRICTLY (match Stage 9)
+    device = _device()
+    model = _build_backbone(backbone).to(device)
+    loaded_ok = False
+    if model_path:
+        try:
+            sd = torch.load(str(model_path), map_location=device)
+            for key in ('state_dict','model','net','weights'):
+                if isinstance(sd, dict) and key in sd and isinstance(sd[key], dict):
+                    sd = sd[key]
+                    break
+            missing, unexpected = model.load_state_dict(sd, strict=True)
+            loaded_ok = True
+            if print_load_status:
+                print(f"[stage4] Loaded weights OK from: {model_path}")
+        except Exception as e:
+            print(f"[stage4] ERROR: failed to load weights from {model_path}: {e}")
+    if not loaded_ok:
+        msg = "[stage4] Weights not loaded; refusing to run CNN (would yield ~0.5 confidences)."
+        if fail_if_weights_missing:
+            raise RuntimeError(msg)
+        else:
+            print(msg)
+
+    model.eval()
+    return model, device
+
+def patch_transform(imagenet_normalize: bool = False):
+    # Transform (match Stage 9 / your standalone script): ToTensor only by default
+    tfms = [T.ToTensor()]
+    if imagenet_normalize:
+        tfms.append(T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]))
+    return T.Compose(tfms)
+
+def row_center(r: dict, has_xy_sem: bool) -> Optional[Tuple[float, float]]:
+    try:
+        x = float(r['x']); y = float(r['y'])
+        w = int(float(r['w'])); h = int(float(r['h']))
+    except Exception:
+        return None
+
+    if has_xy_sem and str(r.get('xy_semantics','')).lower() == 'center':
+        return x, y
+    return x + w/2.0, y + h/2.0
+
+@torch.no_grad()
+def label_patches(model, device, pending_tensors: List[torch.Tensor], pending_meta: List[Tuple[dict, float, float]],
+                  class_to_keep: int, firefly_conf_thresh: float) -> List[dict]:
+    if not pending_tensors:
+        return []
+    batch = torch.stack(pending_tensors, dim=0).to(device)
+    logits = model(batch)
+    FIRE_IDX = int(class_to_keep)
+    BACK_IDX = 1 - FIRE_IDX
+    out_rows: List[dict] = []
+    for i, (r, _cx, _cy) in enumerate(pending_meta):
+        lg = logits[i].detach().float().cpu().numpy().tolist()
+        bg = float(lg[BACK_IDX]); ff = float(lg[FIRE_IDX])
+        conf = _softmax_fire_prob(bg, ff)
+        cls  = 'firefly' if conf >= float(firefly_conf_thresh) else 'background'
+        out = dict(r)
+        out['class'] = cls
+        out['background_logit'] = bg
+        out['firefly_logit'] = ff
+        out['firefly_confidence'] = conf
+        out_rows.append(out)
+    return out_rows
+
 @torch.no_grad()
 def classify_and_filter_csv(
     orig_path: Path, csv_path: Path, *,
@@ -100,37 +170,9 @@ def classify_and_filter_csv(
         except Exception:
             continue
 
-    # Build model and load weights STRICTLY (match Stage 9)
-    device = _device()
-    model = _build_backbone(backbone).to(device)
-    loaded_ok = False
-    if model_path:
-        try:
-            sd = torch.load(str(model_path), map_location=device)
-            for key in ('state_dict','model','net','weights'):
-                if isinstance(sd, dict) and key in sd and isinstance(sd[key], dict):
-                    sd = sd[key]
-                    break
-            missing, unexpected = model.load_state_dict(sd, strict=True)
-            loaded_ok = True
-            if print_load_status:
-                print(f"[stage4] Loaded weights OK from: {model_path}")
-        except Exception as e:
-            print(f"[stage4] ERROR: failed to load weights from {model_path}: {e}")
-    if not loaded_ok:
-        msg = "[stage4] Weights not loaded; refusing to run CNN (would yield ~0.5 confidences)."
-        if fail_if_weights_missing:
-            raise RuntimeError(msg)
-        else:
-            print(msg)
-
-    model.eval()
-
-    # Transform (match Stage 9 / your standalone script): ToTensor only by default
-    tfms = [T.ToTensor()]
-    if imagenet_normalize:
-        tfms.append(T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]))
-    transform = T.Compose(tfms)
+    model, device = load_classifier(model_path, backbone, print_load_status=print_load_status,
+                                    fail_if_weights_missing=fail_if_weights_missing)
+    transform = patch_transform(imagenet_normalize)
 
     # Video
     cap = cv2.VideoCapture(str(orig_path))
@@ -144,25 +186,7 @@ def classify_and_filter_csv(
 
     # Helper to flush an accumulated cross-frame patch batch
     def _flush(pending_tensors: List[torch.Tensor], pending_meta: List[Tuple[dict, float, float]]):
-        if not pending_tensors:
-            return [], []
-        batch = torch.stack(pending_tensors, dim=0).to(device)
-        logits = model(batch)
-        FIRE_IDX = int(class_to_keep)
-        BACK_IDX = 1 - FIRE_IDX
-        out_rows: List[dict] = []
-        for i, (r, _cx, _cy) in enumerate(pending_meta):
-            lg = logits[i].detach().float().cpu().numpy().tolist()
-            bg = float(lg[BACK_IDX]); ff = float(lg[FIRE_IDX])
-            conf = _softmax_fire_prob(bg, ff)
-            cls  = 'firefly' if conf >= float(firefly_conf_thresh) else 'background'
-            out = dict(r)
-            out['class'] = cls
-            out['background_logit'] = bg
-            out['firefly_logit'] = ff
-            out['firefly_confidence'] = conf
-            out_rows.append(out)
-        return out_rows, []
+        return label_patches(model, device, pending_tensors, pending_meta, class_to_keep, firefly_conf_thresh), []
 
     # Accumulator for cross-frame batching (enabled if patch_batch_size > 0)
     pending_tensors: List[torch.Tensor] = []
@@ -179,16 +203,10 @@ def classify_and_filter_csv(
         dets = by_frame.get(fr, [])
         if dets:
             for r in dets:
-                try:
-                    x = float(r['x']); y = float(r['y'])
-                    w = int(float(r['w'])); h = int(float(r['h']))
-                except Exception:
+                center = row_center(r, has_xy_sem)
+                if center is None:
                     continue
-
-                if has_xy_sem and str(r.get('xy_semantics','')).lower() == 'center':
-                    cx, cy = x, y
-                else:
-                    cx, cy = x + w/2.0, y + h/2.0
+                cx, cy = center
 
                 pil = _center_crop_clamped_bgr_to_pil(frame, cx, cy, patch_w, patch_h)
                 if debug_save_patches_dir:

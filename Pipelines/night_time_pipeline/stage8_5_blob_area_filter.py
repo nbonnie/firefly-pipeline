@@ -62,6 +62,11 @@ def _largest_cc_area_pixels_over(gray: np.ndarray, strict_brightness_floor: int)
         return 0
     return int(stats[1:, cv2.CC_STAT_AREA].max())
 
+def blob_area_of_row(frame_bgr, row: dict, strict_brightness_floor: int) -> int:
+    crop_bgr, cx, cy, fidx, w, h = _crop_from_row(frame_bgr, row)
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY) if crop_bgr.size else None
+    return _largest_cc_area_pixels_over(gray, strict_brightness_floor)
+
 # ──────────────────────────────────────────────────────────────
 # CSV helpers
 def _read_csv_rows(csv_path: Path) -> List[dict]:
@@ -147,9 +152,7 @@ def stage8_5_prune_by_blob_area(
                 if has_class and r.get('class') != 'firefly':
                     continue
                 try:
-                    crop_bgr, cx, cy, fidx, w, h = _crop_from_row(frame, r)
-                    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY) if crop_bgr.size else None
-                    area = _largest_cc_area_pixels_over(gray, min_pixel_brightness_to_be_considered_in_area_calculation)
+                    area = blob_area_of_row(frame, r, min_pixel_brightness_to_be_considered_in_area_calculation)
                     if area < int(area_threshold_px):
                         keep_mask[idx] = False
                 except Exception:

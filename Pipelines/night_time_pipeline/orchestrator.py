@@ -40,6 +40,7 @@ from stage12_fp_analysis import stage12_fp_nearest_tp_analysis
 from stage8_6_neighbor_hunt import stage8_6_run
 from stage8_7_large_flash_bfs import stage8_7_expand_large_fireflies
 from stage8_8_streak_grow_filter import stage8_8_grow_and_filter_streaks
+from stage2_to_8_7_single_pass import run_stages_2_to_8_7
 from stage8_9_gt_gaussian_centroid import stage8_9_recenter_gt_gaussian_centroid
 
 from stage8_sync import rebuild_fireflies_logits_from_main
@@ -47,7 +48,7 @@ from stage0_cleanup import cleanup_inference_root
 from stage14_detection_summary import stage14_generate_detection_summary
 from pipeline_params import *  # noqa: F403
 
-if RUN_PRE_RUN_CLEANUP:
+if RUN_PRE_RUN_CLEANUP and PIPELINE_PHASE != 'post':
     print("[stage0_cleanup] Running pre-run cleanup…")
     cleanup_inference_root(
         ROOT,
@@ -72,7 +73,7 @@ for d in [DIR_CSV, DIR_OUT_BGS, DIR_OUT_ORIG, DIR_OUT_ORIG_10,
 def _print_stage_timing(stage_times: dict, video_stem: str):
     # Stages counted toward the *detection pipeline* time (rendering excluded)
     pipeline_order = [
-        '01_detect','02_recenter','03_area_filter','04_cnn',
+        '01_detect','02_8_7_single_pass','02_recenter','03_area_filter','04_cnn',
         '07_merge','08_gauss','08_5_blob_area','08_6_neighbor_hunt',
         '08_7_large_flash_bfs','08_5_after_8_7',  # <- included if present
         '08_8_streak_filter'
@@ -190,7 +191,7 @@ def main():
         csv_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Stage 1 — detect
-        if RUN_STAGE1:
+        if RUN_STAGE1 and PIPELINE_PHASE != 'post':
             if STAGE1_VARIANT == 'blob':
                 _t0 = time.perf_counter()
                 detect_blobs_to_csv(
@@ -231,8 +232,36 @@ def main():
 
             else:
                 raise ValueError(f"Unknown STAGE1_VARIANT={STAGE1_VARIANT!r} (expected 'blob'|'cc_cpu'|'cc_cuda'|'cucim')")
+
+        if PIPELINE_PHASE == 'detect':
+            _print_stage_timing(stage_times, base)
+            continue
+
+        # Stages 2 to 8.7 in one pass over the video (Stage 8.6 needs the separate stages)
+        single_pass = (
+            SINGLE_DECODE_PASS and not RUN_STAGE8_6
+            and RUN_STAGE2 and RUN_STAGE3 and RUN_STAGE4 and USE_CNN_FILTER and RUN_STAGE7
+            and RUN_STAGE8 and RUN_STAGE8_5 and RUN_STAGE8_7 and RUN_STAGE8_5_AFTER_8_7
+        )
+        render_csv_path = csv_path
+        if single_pass:
+            _t0 = time.perf_counter()
+            wants_render = (RUN_STAGE5 and (SAVE_ANN_BG or SAVE_ANN_ORIG)) or (RUN_STAGE6 and SAVE_ANN_10PX)
+            after_stage4_csv = csv_path.parent / f"{csv_path.stem}_after_stage4.csv"
+            run_stages_2_to_8_7(
+                orig_path=orig_path,
+                csv_path=csv_path,
+                snapshot_csv_path=csv_path.parent / f"{csv_path.stem}_area_snapshot.csv",
+                crop_dir=DIR_STAGE8_CROPS / base,
+                after_stage4_csv_path=after_stage4_csv if wants_render else None,
+            )
+            stage_times['02_8_7_single_pass'] = time.perf_counter() - _t0
+            rebuild_fireflies_logits_from_main(csv_path)
+            if wants_render and after_stage4_csv.exists():
+                render_csv_path = after_stage4_csv
+
         # Stage 2 — recenter via intensity centroid (drop dim crops)
-        if RUN_STAGE2:
+        if RUN_STAGE2 and not single_pass:
             _t0 = time.perf_counter()
             recenter_boxes_with_centroid(
                 orig_path=orig_path,
@@ -244,7 +273,7 @@ def main():
             stage_times['02_recenter'] = time.perf_counter() - _t0
 
         # Stage 3 — area filter (in-place) + snapshot
-        if RUN_STAGE3:
+        if RUN_STAGE3 and not single_pass:
             _t0 = time.perf_counter()
             snapshot_csv = csv_path.parent / f"{csv_path.stem}_area_snapshot.csv"
             filter_boxes_by_area(
@@ -255,7 +284,7 @@ def main():
             stage_times['03_area_filter'] = time.perf_counter() - _t0
 
         # Stage 4 — CNN classify/filter (adds logits/confidence/class)
-        if RUN_STAGE4 and USE_CNN_FILTER:
+        if RUN_STAGE4 and USE_CNN_FILTER and not single_pass:
             _t0 = time.perf_counter()
             classify_and_filter_csv(
                 orig_path=orig_path,
@@ -284,7 +313,7 @@ def main():
                 out_bg_path = DIR_OUT_BGS / f"{base}_bs_annotated.mp4"
                 render_from_csv(
                     video_path=bs_path,
-                    csv_path=csv_path,
+                    csv_path=render_csv_path,
                     out_path=out_bg_path,
                     color=(0, 0, 255),
                     thickness=BBOX_THICKNESS,
@@ -296,7 +325,7 @@ def main():
                 out_orig_path = DIR_OUT_ORIG / f"{base}_orig_annotated.mp4"
                 render_from_csv(
                     video_path=orig_path,
-                    csv_path=csv_path,
+                    csv_path=render_csv_path,
                     out_path=out_orig_path,
                     color=(0, 0, 255),
                     thickness=BBOX_THICKNESS,
@@ -312,7 +341,7 @@ def main():
             out_orig_10px_path = DIR_OUT_ORIG_10 / f"{base}_orig_10px.mp4"
             render_fixed_10px_from_csv(
                 video_path=orig_path,
-                csv_path=csv_path,
+                csv_path=render_csv_path,
                 out_path=out_orig_10px_path,
                 thickness=BBOX_THICKNESS,
                 max_frames=MAX_FRAMES,
@@ -323,7 +352,7 @@ def main():
             stage_times['06_render10'] = time.perf_counter() - _t0
 
         # Stage 7 — prune overlaps (union-find keep-heaviest)
-        if RUN_STAGE7:
+        if RUN_STAGE7 and not single_pass:
             _t0 = time.perf_counter()
             prune_overlaps_keep_heaviest_unionfind(
                 orig_video_path=orig_path,
@@ -337,7 +366,7 @@ def main():
 
 
         # Stage 8 — Gaussian centroid recenter (rewrites CSV; x,y become centers; w,h fixed to patch; adds xy_semantics='center')
-        if RUN_STAGE8:
+        if RUN_STAGE8 and not single_pass:
             _t0 = time.perf_counter()
             recenter_gaussian_centroid(
                 orig_video_path=orig_path,
@@ -353,7 +382,7 @@ def main():
             rebuild_fireflies_logits_from_main(csv_path)
         
         # Stage 8.5 — prune firefly detections by blob area (> brightness floor), keep files in sync
-        if RUN_STAGE8_5:
+        if RUN_STAGE8_5 and not single_pass:
             _t0 = time.perf_counter()
             stage8_5_prune_by_blob_area(
                 orig_video_path=orig_path,
@@ -379,7 +408,7 @@ def main():
             rebuild_fireflies_logits_from_main(csv_path)
 
          # ── NEW: Stage 8.7 — grow large flashes & replace 10x10 shards
-        if RUN_STAGE8_7:
+        if RUN_STAGE8_7 and not single_pass:
             _t0 = time.perf_counter()
             stage8_7_expand_large_fireflies(
                 orig_video_path=orig_path,
@@ -395,7 +424,7 @@ def main():
             rebuild_fireflies_logits_from_main(csv_path)
 
         # Re-run 8.5 AFTER 8.7 so replacements/center shifts are re-checked
-        if RUN_STAGE8_5_AFTER_8_7:
+        if RUN_STAGE8_5_AFTER_8_7 and not single_pass:
             _t0 = time.perf_counter()
             stage8_5_prune_by_blob_area(
                 orig_video_path=orig_path,
@@ -421,6 +450,7 @@ def main():
                 grow_frames=STAGE8_8_GROW_FRAMES,
                 max_frame_gap=STAGE8_8_MAX_FRAME_GAP,
                 min_width_frames=STAGE8_8_MIN_WIDTH_FRAMES,
+                min_flicker_frames=STAGE8_8_MIN_FLICKER_FRAMES,
                 max_base_frac=STAGE8_8_MAX_BASE_FRAC,
                 max_streak_seconds=STAGE8_8_MAX_STREAK_SECONDS,
                 dedupe_px=STAGE8_8_DEDUPE_PX,
