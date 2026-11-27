@@ -79,6 +79,7 @@ def run_stages_2_to_8_7(
     """
     P = _orc()
     max_frames = P.MAX_FRAMES
+    first = P.START_FRAME
 
     rows = list(csv.DictReader(csv_path.open()))
     if not rows:
@@ -102,7 +103,7 @@ def run_stages_2_to_8_7(
     recenter_limit = min(max_frame_in_csv, total_frames)
     if max_frames is not None:
         recenter_limit = min(recenter_limit, max_frames)
-    sparse = len(by_frame) / float(max(1, recenter_limit + 1)) <= 0.10
+    sparse = len(by_frame) / float(max(1, recenter_limit + 1 - first)) <= 0.10
 
     def _stage2_reads(fr: int) -> bool:
         if sparse:
@@ -138,7 +139,7 @@ def run_stages_2_to_8_7(
     spent = defaultdict(float)
 
     t_wait = time.perf_counter()
-    for start, frames in read_ahead(frame_chunks(cap, int(P.SINGLE_PASS_CHUNK_FRAMES), limit)):
+    for start, frames in read_ahead(frame_chunks(cap, int(P.SINGLE_PASS_CHUNK_FRAMES), limit, first)):
         t0 = time.perf_counter()
         spent['frames'] += t0 - t_wait
 

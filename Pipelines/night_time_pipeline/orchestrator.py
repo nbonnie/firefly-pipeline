@@ -48,6 +48,10 @@ from stage0_cleanup import cleanup_inference_root
 from stage14_detection_summary import stage14_generate_detection_summary
 from pipeline_params import *  # noqa: F403
 
+START_FRAME = int(START_FRAME or 0)
+if END_FRAME is not None:
+    MAX_FRAMES = END_FRAME + 1 if MAX_FRAMES is None else min(MAX_FRAMES, END_FRAME + 1)
+
 if RUN_PRE_RUN_CLEANUP and PIPELINE_PHASE != 'post':
     print("[stage0_cleanup] Running pre-run cleanup…")
     cleanup_inference_root(
@@ -227,6 +231,8 @@ def main():
                     max_frames=MAX_FRAMES,
                     **_pack_stage1_params_for(STAGE1_VARIANT),
                 )
+                if START_FRAME:
+                    stage1_kwargs['start_frame'] = START_FRAME
                 _stage1_impl(**stage1_kwargs)
                 stage_times['01_detect'] = time.perf_counter() - _t0
 
@@ -457,6 +463,7 @@ def main():
                 box_w=STAGE8_PATCH_W,
                 box_h=STAGE8_PATCH_H,
                 max_frames=MAX_FRAMES,
+                start_frame=START_FRAME,
                 verbose=True,
             )
             stage_times['08_8_streak_filter'] = time.perf_counter() - _t0

@@ -519,6 +519,7 @@ def detect_stage1_to_csv(
     clahe_tile: int | tuple[int, int] = 8,
     # New: batch multiple frames per GPU upload/compute pass
     batch_size: int = 8,
+    start_frame: int = 0,
 ) -> None:
     """Detect blobs using cuCIM (GPU) and write bounding boxes to CSV."""
     csv_path = Path(csv_path)
@@ -699,7 +700,9 @@ def detect_stage1_to_csv(
         ring = None
         frame = None
         gray = None
-        frame_idx = 0
+        frame_idx = start_frame
+        if start_frame:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
         k = 0
         while True:
             idx_batch: list[int] = []

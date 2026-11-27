@@ -2,6 +2,8 @@
 import queue
 import threading
 
+import cv2
+
 _DONE = object()
 
 
@@ -47,13 +49,15 @@ def read_ahead(items, depth: int = 1):
         worker.join(timeout=10)
 
 
-def frame_chunks(cap, chunk_frames: int, limit=None, buffers: int = 3):
+def frame_chunks(cap, chunk_frames: int, limit=None, first: int = 0, buffers: int = 3):
     """
     Yields (index_of_first_frame, frames) for consecutive runs of up to chunk_frames
-    frames, decoding into `buffers` sets of frames that are reused in turn.
+    frames from frame `first` on, decoding into `buffers` sets of frames that are reused in turn.
     """
     ring = [[] for _ in range(buffers)]
-    start = 0
+    if first:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, first)
+    start = first
     k = 0
     while True:
         frames = ring[k % buffers]

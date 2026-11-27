@@ -30,6 +30,8 @@ DIR_STAGE14_OUT = ROOT / 'stage14 detection summaries'
 
 # Global knobs / flags
 MAX_FRAMES = None
+START_FRAME = None   # first frame to process, numbered as in the video
+END_FRAME = None     # last frame to process
 BBOX_THICKNESS = VIDEO_RENDER_BBOX_THICKNESS_PX
 RENDER_ENFORCE_SOURCE_VIDEO_RESOLUTION = ENFORCE_SOURCE_VIDEO_RESOLUTION
 DRAW_BACKGROUND_BOXES = True

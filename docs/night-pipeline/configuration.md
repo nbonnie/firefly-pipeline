@@ -103,6 +103,15 @@ MAX_FRAMES = None
 
 Use an integer for short smoke tests.
 
+## Frame Range
+
+```python
+START_FRAME = None
+END_FRAME = None
+```
+
+Set both to process only that part of a video, for example `START_FRAME = 10000` and `END_FRAME = 12000`. Both frames are included, and frame numbers in every output stay the video's own, so the first detections are written at frame 10000. Stage 1, the single pass and Stage 8.8 seek to `START_FRAME` instead of decoding the frames before it, and Stage 8.8 does not grow a flash past either end. The separate per-stage path (used with Stage 8.6) gives the same rows but still decodes from frame 0.
+
 The gateway sets full-frame processing by default unless `--max-frames` is passed or inferred.
 
 ## Stage 1 Variant

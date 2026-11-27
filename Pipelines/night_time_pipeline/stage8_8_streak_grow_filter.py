@@ -75,11 +75,11 @@ def _link_streaks(dets: List[tuple], radius_px: float, max_gap: int) -> List[Lis
                 open_ids.append(len(streaks) - 1)
     return streaks
 
-def _sample_positions(streak: List[tuple], grow_frames: int, last_frame: int):
+def _sample_positions(streak: List[tuple], grow_frames: int, first_frame: int, last_frame: int):
     fs = np.array([d[1] for d in streak], dtype=np.float64)
     xs = np.array([d[2] for d in streak], dtype=np.float64)
     ys = np.array([d[3] for d in streak], dtype=np.float64)
-    start = max(0, int(fs[0]) - grow_frames)
+    start = max(first_frame, int(fs[0]) - grow_frames)
     end = min(last_frame, int(fs[-1]) + grow_frames)
     fr = np.arange(start, end + 1, dtype=np.float64)
     px = np.interp(fr, fs, xs)
@@ -147,6 +147,7 @@ def stage8_8_grow_and_filter_streaks(
     box_w: int = 10,
     box_h: int = 10,
     max_frames: Optional[int] = None,
+    start_frame: int = 0,
     verbose: bool = True,
 ) -> Tuple[int, int, int]:
     """
@@ -197,7 +198,7 @@ def stage8_8_grow_and_filter_streaks(
     tracks: List[dict] = []
     by_frame: Dict[int, List[tuple]] = defaultdict(list)
     for sid, st in enumerate(streaks):
-        start, px, py = _sample_positions(st, grow_frames, limit - 1)
+        start, px, py = _sample_positions(st, grow_frames, start_frame, limit - 1)
         n = len(px)
         tracks.append({
             'start': start,
@@ -210,7 +211,7 @@ def stage8_8_grow_and_filter_streaks(
             by_frame[start + k].append((sid, k, px[k], py[k]))
 
     last_needed = max(by_frame) if by_frame else -1
-    for first, frames in read_ahead(frame_chunks(cap, READ_CHUNK_FRAMES, last_needed + 1)):
+    for first, frames in read_ahead(frame_chunks(cap, READ_CHUNK_FRAMES, last_needed + 1, start_frame)):
         for fr, frame in enumerate(frames, first):
             todo = by_frame.get(fr)
             if todo:
